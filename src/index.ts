@@ -2,8 +2,9 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { writeClipboard } from "./clipboard";
-import { registerCommandsSlot, type V2Context } from "./commands";
+import { registerCommandsSlot } from "./commands";
 import { findMatchingLeader, type KeyLike, leaderChar } from "./leader";
+import type { V2Context } from "./seam";
 import { checkForUpdate } from "./version";
 import {
   type Action,
@@ -539,6 +540,11 @@ const plugin: V2Plugin = {
     // TEMP-VERIFY: screen-capture signal that setup ran. Removed in a
     // follow-up commit after runtime verification.
     context?.ui?.toast?.show?.({ message: "vimcode: setup", variant: "info", duration: 1000 });
+    const debugToast = (message: string) => {
+      try {
+        context.ui?.toast?.show({ message, variant: "info", duration: 1500 });
+      } catch {}
+    };
     registerCommandsSlot({
       context,
       layerConfig,
@@ -546,7 +552,10 @@ const plugin: V2Plugin = {
       onRegistered: (baseline) => {
         baselineMode = baseline;
       },
-      onUnregister: (off) => disposers.push(off),
+      onUnregister: (off) => {
+        disposers.push(off as () => void);
+      },
+      toast: debugToast,
     });
 
     return () => {
