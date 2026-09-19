@@ -30,7 +30,7 @@ V2 has no raw key intercepts. The plugin registers ONE global keymap layer at pr
 
 V2 specifics to remember:
 - **Binds are exact-match.** The layer only sees events matching a bound key, so modifier combos the engine consumes must be bound explicitly (`ctrl+return`, `ctrl+o` in `MODIFIER_BINDS`). Normal/visual handlers PASS on any ctrl, so all other ctrl combos stay unbound and fall through to host bindings.
-- **Foreign input modes disable the layer.** The layer carries `enabled: () => !state.disabled && vimLayerActive()`, where `baselineMode` is captured via `keymap.mode.current()` at slot-render registration time and `vimLayerActive()` compares the live mode against it (undeterminable mode ⇒ keep enabled). `state.disabled` (the /vim toggle) gates at the layer level too, composing with the per-key `run()` backstop checks.
+- **Foreign input modes disable key commands only.** Each key command carries `enabled: () => !state.disabled && vimLayerActive()`, where `baselineMode` is captured via `keymap.mode.current()` at slot-render registration time and `vimLayerActive()` compares the live mode against it (undeterminable mode ⇒ keep enabled). Do NOT hoist this to layer-level `enabled`: the palette lists only currently-reachable commands and a foreign mode ("modal") is pushed while the palette itself is open, so layer-level gating hides `:q`/`:wq`/`:w`//vim` from the palette exactly when it is shown. Palette/slash commands carry `enabled: () => !state.disabled` only — they have no bind and can't intercept keys. Both gates compose with the per-key `run()` backstop checks.
 - **`keymap.layer()` must be called from inside a slot render.** The keymap bridge resolves its provider with Solid `useContext` and throws "Keymap.Provider is missing" when called from `setup()` (outside the component tree). The plugin claims a no-op slot (`append: "app"`, `render` returns `null`) and registers the layer there once, guarded by a flag (slot renders are reactive and can run multiple times — never dispose/recreate). `keymap.dispatch` and `keymap.mode.current` are wrapped in try/catch for the same reason; other surfaces (ui/storage/router/renderer/data) are host services and need no guarding.
 - `context.storage.store(name, { initial })` returns `[Store, mutate]`; `mutate((draft) => {...})` is the write path. `src/index.ts` wraps it in a tiny async kv shim so `version.ts` and the disabled flag keep their get/set shape.
 - `keymap.dispatch(id)` returns `void` (no `{ ok }`), so insert-mode autocomplete handling dispatches `prompt.autocomplete.*` and falls through instead of conditionally consuming.
@@ -70,7 +70,7 @@ This API surface makes text objects (`ciw`, `di"`), direct cursor manipulation, 
 
 ```
 src/
-  index.ts       (623 lines)  Plugin entry: V2 setup(), slot-scoped keymap layer registration, action application
+  index.ts       (631 lines)  Plugin entry: V2 setup(), slot-scoped keymap layer registration, action application
   vim/                        Pure vim engine (thin barrel re-exports the public surface):
     index.ts     (7 lines)    Barrel — public surface only. No export *, no internals.
     types.ts     (57 lines)   Action union, VimState, Mode, Operator, Pending, Range, KeyEvent, HandlerResult, PromptAccess
@@ -96,7 +96,7 @@ test/
     normal.test.ts   (823)    handleNormalKey branches
     visual.test.ts   (287)    handleVisualKey branches
     textobject.test.ts (64)   resolveTextObject dispatch seam
-  integration.test.ts (649)   Full pipeline: V2 mock context + setup(), one-shot normal, undo snapshots, version sync, prompt overlay tracking, modifier binds + layer gating
+  integration.test.ts (656)   Full pipeline: V2 mock context + setup(), one-shot normal, undo snapshots, version sync, prompt overlay tracking, modifier binds + per-command gating
   leader.test.ts (125 lines)  Unit tests for leader key matching functions
 ```
 

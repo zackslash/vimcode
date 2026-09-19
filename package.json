@@ -29,7 +29,6 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.15",
-    "@opencode/plugin": "2.0.9",
     "@types/node": "^26.6.2",
     "tsx": "^4.22.1",
     "typescript": "^5.9.3"

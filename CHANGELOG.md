@@ -19,7 +19,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 ### Fixed
 
 - Insert-mode Ctrl+Enter submits again: V2 binds are exact-match, so the two modifier combos the engine consumes (`ctrl+return` → submit, `ctrl+o` → one-shot normal) are now explicitly bound in the generated keymap layer. All other ctrl combos remain unbound and fall through to host bindings.
-- Permission/question prompts are navigable again: the layer now disables itself reactively whenever the active input mode differs from the baseline captured at registration (foreign input modes = an overlay owns the keyboard), and the router session check reads the V2 discriminated union (`route.type === "session"`, with `route.name` as a defensive fallback).
+- Slim plugin dependencies: dropped `@opencode/plugin` from devDependencies and removed the stray `package-lock.json` so package installs stay fast and dependency-free (the host injects its SDK at runtime).
+- Permission/question prompts are navigable again: each key command disables itself reactively whenever the active input mode differs from the baseline captured at registration (foreign input modes = an overlay owns the keyboard), and the router session check reads the V2 discriminated union (`route.type === "session"`, with `route.name` as a defensive fallback). The gate is per key-command, not layer-level: the palette lists only currently-reachable commands and a "modal" mode is pushed while the palette itself is open, so the palette/slash commands (`:q`, `:wq`, `:w`, `/vim`) stay enabled in every mode.
 
 ### Known gaps
 

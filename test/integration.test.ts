@@ -213,6 +213,7 @@ describe("version sync", () => {
 type MockCommand = {
   id?: string;
   bind?: string;
+  enabled?: () => boolean;
   /* biome-ignore lint/suspicious/noExplicitAny: event shape is host-owned */
   run: (input?: unknown, event?: any) => unknown;
 };
@@ -301,14 +302,13 @@ function createMockContext(init: {
   };
 
   // Drives the one shared key command: every bound key's run delegates to
-  // the same handleKey, so any bind works. Respects the layer's `enabled`
-  // gate (disabled layer = the host never dispatches to it → pass through).
-  // Returns whether it consumed.
+  // the same handleKey, so any bind works. Respects the command's own
+  // `enabled` gate (a disabled command is unreachable → the host never
+  // dispatches to it → pass through). Returns whether it consumed.
   const press = (name: string, opts: Record<string, boolean> = {}) => {
-    const cfg = layer?.();
-    const cmd = cfg?.commands?.find((c) => c.bind !== undefined);
+    const cmd = layer?.()?.commands?.find((c) => c.bind !== undefined);
     if (!cmd) throw new Error("no keymap layer registered");
-    if (typeof cfg.enabled === "function" && cfg.enabled() === false) return false;
+    if (typeof cmd.enabled === "function" && cmd.enabled() === false) return false;
     const result = cmd.run(undefined, { name, eventType: "press", ...opts });
     return result !== false;
   };
@@ -564,27 +564,34 @@ describe("modifier combos and layer gating", () => {
     expect(mock.press("h")).toBe(false);
   });
 
-  it("a foreign input mode disables the layer; restoring the baseline re-enables it", async () => {
+  it("a foreign input mode disables key commands, not palette commands", async () => {
     const mock = createMockContext({ editor: undefined, options: { updateCheck: false } });
     await mock.load();
     mock.press("escape"); // enter normal mode; baseline mode was "base"
     expect(mock.press("j")).toBe(true);
 
     mock.setMode("modal");
+    // Key commands are unreachable (don't swallow overlay keys)...
     expect(mock.press("j")).toBe(false);
+    // ...but palette/slash commands stay enabled so the palette can list them.
+    const vimCmd = mock.layerConfig()?.commands?.find((c) => c.id === "vimcode.vim");
+    expect(vimCmd?.enabled?.()).toBe(true);
 
     mock.setMode("base");
     expect(mock.press("j")).toBe(true);
   });
 
-  it("the /vim toggle disables the whole layer", async () => {
+  it("the /vim toggle disables key and palette commands alike", async () => {
     const mock = createMockContext({ editor: undefined, options: { updateCheck: false } });
     await mock.load();
     mock.press("escape");
     const vimCmd = mock.layerConfig()?.commands?.find((c) => c.id === "vimcode.vim");
     if (!vimCmd) throw new Error(":vim command not registered");
     await vimCmd.run();
+    // Key commands dead...
     expect(mock.press("j")).toBe(false);
+    // ...and palette commands too (state.disabled gates both).
+    expect(vimCmd.enabled?.()).toBe(false);
   });
 });
 
