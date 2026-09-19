@@ -3,6 +3,9 @@ import { createVimState, finishOneShotIfComplete, handleInsertKey, handleNormalK
 import { mockPrompt } from "./fixtures";
 import { ev } from "./support";
 
+// Isolate resolveLeaderKeys() from the developer's real ~/.config/opencode/cli.json.
+process.env.XDG_CONFIG_HOME = "/tmp/opencode/vimcode-test-no-config";
+
 let state: VimState;
 
 beforeEach(() => {
@@ -204,30 +207,118 @@ describe("version sync", () => {
   });
 });
 
+// ── V2 mock context harness ───────────────────────────────
+
+// Shape of one command inside a keymap layer (subset the harness needs).
+type MockCommand = {
+  id?: string;
+  bind?: string;
+  /* biome-ignore lint/suspicious/noExplicitAny: event shape is host-owned */
+  run: (input?: unknown, event?: any) => unknown;
+};
+type MockLayer = { commands?: MockCommand[] };
+
+// Builds a minimal V2 plugin context: sparse by design — fields may be
+// undefined or stubs, which is exactly the hostile environment we need to
+// survive (the scenario that crashed v0.7.0).
+function createMockContext(init: {
+  options?: Record<string, unknown>;
+  editor?: unknown;
+  route?: { type: string; sessionID?: string };
+  mode?: string;
+  sessions?: Record<string, { parentID?: string }>;
+}) {
+  const dispatched: string[] = [];
+  const events = new Map<string, (e: unknown) => void>();
+  let listener: ((e: { details: Record<string, unknown> }) => void) | undefined;
+  let layer: (() => MockLayer) | undefined;
+  const store: Record<string, unknown> = {};
+  const sessions = init.sessions ?? {};
+
+  const ctx = {
+    options: init.options ?? {},
+    location: undefined,
+    storage: {
+      store: (_key: string, o: { initial: Record<string, unknown> }) => [
+        Object.assign(store, o.initial),
+        (mutation: (draft: Record<string, unknown>) => void) => {
+          mutation(store);
+        },
+      ],
+    },
+    ui: {
+      toast: { show: () => {} },
+      router: { current: () => init.route ?? { type: "home" } },
+      // Simulates a mount: the plugin registers its keymap layer from inside
+      // the slot render (keymap.layer requires the in-tree provider).
+      slot: (claim: { render: (input: unknown) => unknown }) => {
+        claim.render({});
+        return () => {};
+      },
+    },
+    keymap: {
+      layer: (fn: () => MockLayer) => {
+        layer = fn;
+      },
+      mode: { current: () => init.mode ?? "base" },
+      dispatch: (id: string) => {
+        dispatched.push(id);
+      },
+    },
+    data: {
+      on: (type: string, h: (e: unknown) => void) => {
+        events.set(type, h);
+        return () => events.delete(type);
+      },
+      listen: (h: (e: { details: Record<string, unknown> }) => void) => {
+        listener = h;
+        return () => {
+          listener = undefined;
+        };
+      },
+      session: {
+        get: (id: string) => sessions[id],
+        form: { list: () => [] },
+        permission: { list: () => [] },
+      },
+    },
+    renderer: { currentFocusedEditor: init.editor },
+  };
+
+  let loaded = false;
+  const load = async () => {
+    if (loaded) return;
+    const plugin = (await import("../src/index")).default;
+    plugin.setup(ctx);
+    loaded = true;
+  };
+
+  // Drives the one shared key command: every bound key's run delegates to
+  // the same handleKey, so any bind works. Returns whether it consumed.
+  const press = (name: string, opts: Record<string, boolean> = {}) => {
+    const cmd = layer?.()?.commands?.find((c) => c.bind !== undefined);
+    if (!cmd) throw new Error("no keymap layer registered");
+    const result = cmd.run(undefined, { name, eventType: "press", ...opts });
+    return result !== false;
+  };
+
+  // Fires an event through the catch-all data.listen channel.
+  const emit = (type: string, properties: Record<string, unknown>) => {
+    listener?.({ details: { type, ...properties } });
+  };
+
+  return { ctx, dispatched, events, load, press, emit };
+}
+
 // ── plugin init sanity check ──────────────────────────────
 
 describe("plugin init", () => {
-  it("tui() does not throw with a minimal mock API", async () => {
+  it("setup() does not throw with a minimal mock context", async () => {
     const plugin = (await import("../src/index")).default;
     expect(plugin.id).toBe("vimcode");
-
-    // Minimal mock matching what OpenCode passes to tui().
-    // Intentionally sparse — some fields are undefined or stubs,
-    // which is exactly the hostile environment we need to survive.
-    const dispatchCommand = () => ({ ok: false });
-    const api = {
-      renderer: undefined,
-      ui: { toast: () => {}, dialog: { open: false } },
-      keymap: { intercept: () => {}, dispatchCommand },
-      route: { current: { name: "home", params: {} } },
-      state: { session: { question: () => [], permission: () => [] } },
-      lifecycle: { onDispose: () => {} },
-      kv: { get: async () => undefined }, // empty object — the scenario that crashed v0.7.0
-    };
-
-    // Should not throw with a sparse mock API.
-    // biome-ignore lint/suspicious/noExplicitAny: mock API doesn't match full plugin types
-    await plugin.tui(api as any, undefined, undefined as any);
+    const { load } = createMockContext({});
+    // Should not throw with a sparse mock context.
+    await load();
   });
 });
 
@@ -272,41 +363,14 @@ describe("undo snapshot — deleteRange + u", () => {
   }
 
   async function setup(text: string, cursor: number) {
-    const plugin = (await import("../src/index")).default;
     const { editor, calls, getText, getCursor } = createMockEditor(text, cursor);
-    const dispatched: string[] = [];
-    // biome-ignore lint/suspicious/noExplicitAny: test mock
-    let handler: (ctx: any) => void;
-
-    const api = {
-      renderer: { currentFocusedEditor: editor, currentFocusedRenderable: editor },
-      ui: { toast: () => {}, dialog: { open: false } },
-      keymap: {
-        intercept: (_e: string, h: typeof handler) => {
-          handler = h;
-        },
-        dispatchCommand: (cmd: string) => {
-          dispatched.push(cmd);
-          return { ok: false };
-        },
-      },
-      route: { current: { name: "home", params: {} } },
-      state: { session: { question: () => [], permission: () => [] } },
-      lifecycle: { onDispose: () => {} },
-      kv: {},
-    };
-
-    // biome-ignore lint/suspicious/noExplicitAny: mock API
-    await plugin.tui(api as any, undefined, undefined as any);
-
-    const press = (name: string, opts: Record<string, boolean> = {}) => {
-      handler?.({ event: { name, eventType: "press", ...opts }, consume: () => {} });
-    };
+    const mock = createMockContext({ editor });
+    await mock.load();
 
     // Enter normal mode
-    press("escape");
+    mock.press("escape");
 
-    return { press, calls, dispatched, getText, getCursor };
+    return { press: mock.press, calls, dispatched: mock.dispatched, getText, getCursor };
   }
 
   it("u after dG restores the full buffer via editBuffer.setText", async () => {
@@ -417,50 +481,18 @@ describe("undo snapshot — deleteRange + u", () => {
   });
 });
 
-// ── arrow keys pass through the intercept (issue #63) ─────
+// ── arrow keys pass through the key layer (issue #63) ─────
 
-describe("arrow keys pass through the intercept", () => {
-  // #63: in normal mode the intercept consumed arrow keys, so OpenCode never
+describe("arrow keys pass through the key layer", () => {
+  // #63: in normal mode the plugin consumed arrow keys, so OpenCode never
   // saw them and couldn't exit the subagent view. This drives the real
-  // pipeline (plugin.tui → key intercept) and asserts consume() is not called
-  // for arrows, while a vim motion still is.
+  // pipeline (plugin.setup → keymap layer command) and asserts the command
+  // does not consume arrows, while a vim motion still is.
   async function setup() {
-    const plugin = (await import("../src/index")).default;
-    // biome-ignore lint/suspicious/noExplicitAny: test mock
-    let handler: (ctx: any) => void;
-
-    const api = {
-      renderer: { currentFocusedEditor: undefined },
-      ui: { toast: () => {}, dialog: { open: false } },
-      keymap: {
-        intercept: (_e: string, h: typeof handler) => {
-          handler = h;
-        },
-        dispatchCommand: () => ({ ok: false }),
-      },
-      route: { current: { name: "home", params: {} } },
-      state: { session: { question: () => [], permission: () => [] } },
-      lifecycle: { onDispose: () => {} },
-      kv: {},
-    };
-
-    // biome-ignore lint/suspicious/noExplicitAny: mock API
-    await plugin.tui(api as any, { updateCheck: false } as any, undefined as any);
-
-    // Returns whether the intercept consumed the key (i.e. called consume()).
-    const press = (name: string, opts: Record<string, boolean> = {}) => {
-      let consumed = false;
-      handler?.({
-        event: { name, eventType: "press", ...opts },
-        consume: () => {
-          consumed = true;
-        },
-      });
-      return consumed;
-    };
-
-    press("escape"); // leave insert, enter normal mode
-    return { press };
+    const mock = createMockContext({ editor: undefined, options: { updateCheck: false } });
+    await mock.load();
+    mock.press("escape"); // leave insert, enter normal mode
+    return { press: mock.press };
   }
 
   for (const arrow of ["up", "down", "left", "right"] as const) {
@@ -484,57 +516,15 @@ describe("prompt overlay tracking", () => {
   // balanced by a terminal event, otherwise hasActivePrompts() stays true and
   // the plugin is stuck passing all keys (including Escape) to the host.
   async function setup() {
-    const plugin = (await import("../src/index")).default;
-    // biome-ignore lint/suspicious/noExplicitAny: test mock
-    let handler: (ctx: any) => void;
-    const events = new Map<string, (e: unknown) => void>();
-    const sessions: Record<string, { parentID?: string }> = { root: {}, child: { parentID: "root" } };
-
-    const api = {
-      renderer: { currentFocusedEditor: undefined },
-      ui: { toast: () => {}, dialog: { open: false } },
-      keymap: {
-        intercept: (_e: string, h: typeof handler) => {
-          handler = h;
-        },
-        dispatchCommand: () => ({ ok: false }),
-      },
-      route: { current: { name: "session", params: { sessionID: "root" } } },
-      state: {
-        session: {
-          get: (id: string) => sessions[id],
-          question: () => [],
-          permission: () => [],
-        },
-      },
-      event: {
-        on: (name: string, h: (e: unknown) => void) => {
-          events.set(name, h);
-          return () => events.delete(name);
-        },
-      },
-      lifecycle: { onDispose: () => {} },
-      kv: {},
-    };
-
-    // biome-ignore lint/suspicious/noExplicitAny: mock API
-    await plugin.tui(api as any, { updateCheck: false } as any, undefined as any);
-
-    const press = (name: string) => {
-      let consumed = false;
-      handler?.({
-        event: { name, eventType: "press" },
-        consume: () => {
-          consumed = true;
-        },
-      });
-      return consumed;
-    };
-
-    const emit = (name: string, properties: Record<string, unknown>) => events.get(name)?.({ properties });
-
-    press("escape"); // leave insert, enter normal mode
-    return { press, emit };
+    const mock = createMockContext({
+      editor: undefined,
+      options: { updateCheck: false },
+      route: { type: "session", sessionID: "root" },
+      sessions: { root: {}, child: { parentID: "root" } },
+    });
+    await mock.load();
+    mock.press("escape"); // leave insert, enter normal mode
+    return { press: mock.press, emit: mock.emit };
   }
 
   it("keys pass through while a question is pending, then resume after question.rejected", async () => {

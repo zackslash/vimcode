@@ -1,4 +1,6 @@
-import type { TuiPluginModule } from "@opencode-ai/plugin/tui";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
 import { writeClipboard } from "./clipboard";
 import { findMatchingLeader, type KeyLike, leaderChar } from "./leader";
 import { checkForUpdate } from "./version";
@@ -13,12 +15,28 @@ import {
   translateKey,
 } from "./vim";
 
-const plugin: TuiPluginModule = {
+// V2 plugin seam. The official types live in @opencode/plugin/tui, whose type
+// graph pulls in @opentui/core and solid-js — packages the host provides at
+// runtime and that must NOT be installed into the plugin (local stubs would
+// shadow the host's module intercepts). The context is therefore typed as
+// `any` and every access is defensive (`?.`), same as the V1 api seam.
+/* biome-ignore lint/suspicious/noExplicitAny: plugin-API seam, host-owned types */
+type V2Context = any;
+
+type V2Plugin = { id: string; setup: (context: V2Context) => (() => void) | undefined };
+
+// The host injects @opencode/plugin/tui and Plugin.define is identity, so a
+// plain module object with the same shape resolves identically without a
+// runtime import of the SDK specifier.
+const plugin: V2Plugin = {
   id: "vimcode",
-  tui: async (api, options) => {
+  setup(context: V2Context) {
     const state = createVimState();
+    const options = context?.options ?? {};
     const startMode = options?.startMode === "normal" ? "normal" : "insert";
     state.mode = startMode;
+    // Resolved once at setup: the CLI config rarely changes mid-session, and
+    // re-reading it per keypress would add file I/O to the hot path.
     const leaderKeys = resolveLeaderKeys();
 
     // Resolve modeIndicator: "toast" (default) or "none".
@@ -31,12 +49,52 @@ const plugin: TuiPluginModule = {
           ? "none"
           : "toast";
 
-    // Load persisted disabled state
-    const persistedDisabled = (await api.kv?.get?.("vimcode.disabled")) as boolean | undefined;
-    state.disabled = persistedDisabled ?? false;
-    if (state.disabled) {
-      api.ui?.toast?.({ message: "Vim mode disabled (use /vim to re-enable)", variant: "info", duration: 3000 });
+    const toast = (opts: { message: string; variant: string; duration: number }) => context?.ui?.toast?.show?.(opts);
+    const dispatch = (cmd: string) => {
+      try {
+        context?.keymap?.dispatch?.(cmd);
+      } catch {
+        // The keymap bridge resolves its provider only inside the app's
+        // component tree; failing silently is the same contract as V1's
+        // dispatch-on-missing-command.
+      }
+    };
+
+    // Tiny async kv shim over the V2 durable store so version.ts and the
+    // disabled flag keep their get/set shape.
+    function createKv() {
+      try {
+        const entry = context?.storage?.store?.("vimcode", { initial: {} });
+        if (Array.isArray(entry) && entry.length >= 2) {
+          const [value, update] = entry;
+          return {
+            get: async (key: string) => value?.[key],
+            set: async (key: string, v: unknown) => {
+              // biome-ignore lint/suspicious/noExplicitAny: store draft is untyped at the seam
+              await update?.((draft: any) => {
+                draft[key] = v;
+              });
+            },
+          };
+        }
+      } catch {}
+      return {
+        get: async (_key: string) => undefined as unknown,
+        set: async (_key: string, _v: unknown) => {},
+      };
     }
+    const kv = createKv();
+
+    // Restoring the persisted disabled state is async in V2 (setup is sync),
+    // so it lands shortly after startup instead of blocking it.
+    kv.get("disabled")
+      .then((v) => {
+        state.disabled = v === true;
+        if (state.disabled) {
+          toast({ message: "Vim mode disabled (use /vim to re-enable)", variant: "info", duration: 3000 });
+        }
+      })
+      .catch(() => {});
 
     // Track whether the previous key was the leader, so the follow-up
     // key also passes through to OpenCode's leader system.
@@ -44,48 +102,94 @@ const plugin: TuiPluginModule = {
     let leaderTimer: ReturnType<typeof setTimeout> | null = null;
 
     // Track pending permissions/questions from child sessions via events.
-    // permission()/question() only covers one session ID, but subagent
-    // prompts live on child IDs. Events fire globally; we aggregate by root.
+    // list() only covers one session ID, but subagent prompts live on child
+    // IDs. Events fire globally; we aggregate by root.
     const pendingChildPrompts = new Map<string, number>();
 
-    // biome-ignore lint/suspicious/noExplicitAny: event shape is untyped in the plugin API
+    // biome-ignore lint/suspicious/noExplicitAny: event shape is untyped at the seam
     function trackPromptEvent(event: any, delta: number) {
       const sessionID = event?.properties?.sessionID ?? event?.sessionID;
       if (!sessionID) return;
-      const session = api.state?.session?.get?.(sessionID);
+      const session = context?.data?.session?.get?.(sessionID);
       const rootId = session?.parentID ?? sessionID;
       const count = (pendingChildPrompts.get(rootId) ?? 0) + delta;
       if (count <= 0) pendingChildPrompts.delete(rootId);
       else pendingChildPrompts.set(rootId, count);
     }
 
-    // biome-ignore lint/suspicious/noExplicitAny: event shape is untyped in the plugin API
-    const unsubPermsAsked = api.event?.on?.("permission.asked", (e: any) => trackPromptEvent(e, 1));
-    // biome-ignore lint/suspicious/noExplicitAny: event shape is untyped in the plugin API
-    const unsubPermsReplied = api.event?.on?.("permission.replied", (e: any) => trackPromptEvent(e, -1));
-    // biome-ignore lint/suspicious/noExplicitAny: event shape is untyped in the plugin API
-    const unsubQuestAsked = api.event?.on?.("question.asked", (e: any) => trackPromptEvent(e, 1));
-    // biome-ignore lint/suspicious/noExplicitAny: event shape is untyped in the plugin API
-    const unsubQuestReplied = api.event?.on?.("question.replied", (e: any) => trackPromptEvent(e, -1));
-    // Dismissing a question emits question.rejected, not question.replied.
-    // Without this the +1 from question.asked never balances and the plugin
-    // stays stuck passing every key through to the host.
-    // biome-ignore lint/suspicious/noExplicitAny: event shape is untyped in the plugin API
-    const unsubQuestRejected = api.event?.on?.("question.rejected", (e: any) => trackPromptEvent(e, -1));
-    api.lifecycle?.onDispose?.(() => {
-      unsubPermsAsked?.();
-      unsubPermsReplied?.();
-      unsubQuestAsked?.();
-      unsubQuestReplied?.();
-      unsubQuestRejected?.();
-    });
+    const disposers: Array<() => void> = [];
+
+    // Prefer the catch-all listener: V2 event names are still settling
+    // (question → form), and subscribing to both the listener and specific
+    // data.on types would double-count prompts.
+    if (typeof context?.data?.listen === "function") {
+      const off = context.data.listen((event: { details?: unknown }) => {
+        /* biome-ignore lint/suspicious/noExplicitAny: event shape is untyped at the seam */
+        const details = event?.details as any;
+        const type = details?.type ?? details?.name;
+        if (typeof type !== "string" || !/^(permission|question|form)\./.test(type)) return;
+        if (/\.(asked|created)$/.test(type)) trackPromptEvent(details, 1);
+        else if (/\.(replied|rejected|answered)$/.test(type)) trackPromptEvent(details, -1);
+      });
+      if (typeof off === "function") disposers.push(off);
+    } else {
+      // Fallback for hosts without data.listen: explicit subscriptions.
+      for (const [type, delta] of [
+        ["permission.asked", 1],
+        ["permission.replied", -1],
+        ["question.asked", 1],
+        ["question.replied", -1],
+        // Dismissing a question emits question.rejected, not question.replied.
+        // Without this the +1 from question.asked never balances and the
+        // plugin stays stuck passing every key through to the host.
+        ["question.rejected", -1],
+      ] as const) {
+        try {
+          /* biome-ignore lint/suspicious/noExplicitAny: event shape is untyped at the seam */
+          const off = context?.data?.on?.(type, (e: any) => trackPromptEvent(e, delta));
+          if (typeof off === "function") disposers.push(off);
+        } catch {}
+      }
+    }
+
+    function currentSessionID(): string | undefined {
+      const route = context?.ui?.router?.current?.();
+      if (!route) return undefined;
+      if (route.type === "session") return route.sessionID;
+      return typeof route.sessionID === "string" ? route.sessionID : undefined;
+    }
 
     function hasActivePrompts(sid: string): boolean {
-      const q = api.state.session.question(sid);
-      if (q && q.length > 0) return true;
-      const p = api.state.session.permission(sid);
-      if (p && p.length > 0) return true;
+      const location = context?.location;
+      const forms = context?.data?.session?.form?.list?.(sid, location) ?? [];
+      if (forms.length > 0) return true;
+      const perms = context?.data?.session?.permission?.list?.(sid) ?? [];
+      if (perms.length > 0) return true;
       return (pendingChildPrompts.get(sid) ?? 0) > 0;
+    }
+
+    // True when something other than the main input owns the keyboard
+    // (dialogs, question/permission overlays). Dialogs register modal
+    // keymap layers, which show up as non-default modes here. Only treat a
+    // positively-identified non-default mode as an overlay; if the value is
+    // missing or unrecognizable we keep vim handling (don't pass through).
+    const NON_OVERLAY_MODES = new Set(["", "base", "normal", "global", "home", "default"]);
+    function overlayActive(): boolean {
+      let mode: unknown;
+      try {
+        mode = context?.keymap?.mode?.current?.();
+      } catch {
+        return false;
+      }
+      if (mode == null) return false;
+      if (typeof mode === "string") return !NON_OVERLAY_MODES.has(mode);
+      const name =
+        typeof mode === "object"
+          ? ((mode as { name?: unknown; id?: unknown; mode?: unknown }).name ??
+            (mode as { id?: unknown }).id ??
+            (mode as { mode?: unknown }).mode)
+          : undefined;
+      return typeof name === "string" ? !NON_OVERLAY_MODES.has(name) : false;
     }
 
     // Snapshots for single-step undo of vim changes.
@@ -96,30 +200,15 @@ const plugin: TuiPluginModule = {
     const prompt = {
       getLine: (n: number) => getInputText().split("\n")[n] ?? "",
       getLineCount: () => getInputText().split("\n").length,
-      getCursorLine: () => api.renderer?.currentFocusedEditor?.visualCursor?.logicalRow ?? 0,
-      getCursorOffset: () => api.renderer?.currentFocusedEditor?.cursorOffset ?? 0,
+      getCursorLine: () => context?.renderer?.currentFocusedEditor?.visualCursor?.logicalRow ?? 0,
+      getCursorOffset: () => context?.renderer?.currentFocusedEditor?.cursorOffset ?? 0,
       getPlainText: () => getInputText(),
     };
 
-    // api.prompt doesn't exist on the TUI plugin API. The actual text lives
-    // on the focused editor exposed by the renderer.
+    // api.prompt doesn't exist on the plugin API. The actual text lives on
+    // the focused editor exposed by the renderer.
     function getInputText(): string {
-      return api.renderer?.currentFocusedEditor?.plainText ?? "";
-    }
-
-    // Read all configured leader keys from OpenCode's keybinds config.
-    function resolveLeaderKeys(): KeyLike[] {
-      const bindings = api.tuiConfig?.keybinds?.get?.("leader") ?? [];
-      return bindings
-        .map((b: { key?: unknown }) => b.key)
-        .filter(
-          (k: unknown): k is KeyLike =>
-            !!k &&
-            k !== "none" &&
-            k !== "false" &&
-            (typeof k === "string" ||
-              (typeof k === "object" && typeof (k as Record<string, unknown>).name === "string")),
-        );
+      return context?.renderer?.currentFocusedEditor?.plainText ?? "";
     }
 
     function applyActions(actions: Action[]) {
@@ -133,12 +222,15 @@ const plugin: TuiPluginModule = {
         }
         switch (action.type) {
           case "cmd":
-            setTimeout(() => api.keymap.dispatchCommand(action.cmd), 0);
+            // Deferred to break out of the key-dispatch stack; dispatching
+            // motion commands synchronously from inside a key handler
+            // silently no-ops (V1 gotcha, unchanged in V2).
+            setTimeout(() => dispatch(action.cmd), 0);
             break;
           case "mode":
             if (modeIndicator === "toast") {
               const label = action.mode === "(insert)" ? action.mode : action.mode.toUpperCase();
-              api.ui?.toast?.({
+              toast({
                 message: label,
                 variant: "info",
                 duration: 800,
@@ -146,7 +238,7 @@ const plugin: TuiPluginModule = {
             }
             break;
           case "toast":
-            api.ui?.toast?.({
+            toast({
               message: action.message,
               variant: "info",
               duration: action.duration ?? 2000,
@@ -156,17 +248,17 @@ const plugin: TuiPluginModule = {
             writeClipboard(action.text);
             break;
           case "insertText":
-            api.renderer?.currentFocusedEditor?.insertText?.(action.text);
+            context?.renderer?.currentFocusedEditor?.insertText?.(action.text);
             break;
           case "yankSelection": {
             // Deferred so it runs after any preceding select commands
             setTimeout(() => {
-              const editor = api.renderer?.currentFocusedEditor;
+              const editor = context?.renderer?.currentFocusedEditor;
               const text = editor?.editorView?.getSelectedText?.() ?? "";
               if (text) {
                 state.yankRegister = text;
                 writeClipboard(text);
-                api.ui?.toast?.({
+                toast({
                   message: "yanked",
                   variant: "info",
                   duration: 1000,
@@ -177,10 +269,10 @@ const plugin: TuiPluginModule = {
             break;
           }
           case "clearSelection":
-            api.renderer?.currentFocusedEditor?.editorView?.resetSelection?.();
+            context?.renderer?.currentFocusedEditor?.editorView?.resetSelection?.();
             break;
           case "deleteRange": {
-            const editor = api.renderer?.currentFocusedEditor;
+            const editor = context?.renderer?.currentFocusedEditor;
             const eb = editor?.editBuffer;
             if (eb?.deleteRange) {
               const text = editor.plainText ?? "";
@@ -191,7 +283,7 @@ const plugin: TuiPluginModule = {
             break;
           }
           case "saveUndoSnapshot": {
-            const editor = api.renderer?.currentFocusedEditor;
+            const editor = context?.renderer?.currentFocusedEditor;
             if (editor) {
               undoSnapshots.push({
                 text: editor.plainText ?? "",
@@ -204,24 +296,24 @@ const plugin: TuiPluginModule = {
           case "undo": {
             const undoSnapshot = undoSnapshots.pop();
             if (undoSnapshot) {
-              const editor = api.renderer?.currentFocusedEditor;
+              const editor = context?.renderer?.currentFocusedEditor;
               const eb = editor?.editBuffer;
               if (eb?.setText && editor) {
                 eb.setText(undoSnapshot.text);
                 editor.cursorOffset = undoSnapshot.cursor;
               }
             } else {
-              setTimeout(() => api.keymap.dispatchCommand("input.undo"), 0);
+              setTimeout(() => dispatch("input.undo"), 0);
             }
             break;
           }
           case "cursorTo": {
-            const editor = api.renderer?.currentFocusedEditor;
+            const editor = context?.renderer?.currentFocusedEditor;
             if (editor) editor.cursorOffset = action.offset;
             break;
           }
           case "selectRange": {
-            const editor = api.renderer?.currentFocusedEditor;
+            const editor = context?.renderer?.currentFocusedEditor;
             if (editor) {
               editor.setSelectionInclusive?.(action.start, action.end);
             }
@@ -232,7 +324,7 @@ const plugin: TuiPluginModule = {
     }
 
     function syncCursorStyle() {
-      const editor = api.renderer?.currentFocusedEditor;
+      const editor = context?.renderer?.currentFocusedEditor;
       if (!editor) return;
       editor.cursorStyle = {
         style: state.mode === "insert" ? "line" : "block",
@@ -241,169 +333,245 @@ const plugin: TuiPluginModule = {
     }
 
     // The Textarea resets cursorStyle during rendering, so re-apply on a
-    // short interval. Setting a property is cheaper than the previous
-    // approach of writing DECSCUSR escape sequences to stdout, and works
-    // in terminals that don't support DECSCUSR (e.g. macOS Terminal.app).
+    // short interval. Setting a property is cheaper than writing DECSCUSR
+    // escape sequences to stdout, and works in terminals that don't support
+    // DECSCUSR (e.g. macOS Terminal.app).
     const cursorInterval = setInterval(syncCursorStyle, 100);
-    api.lifecycle?.onDispose?.(() => clearInterval(cursorInterval));
-    api.lifecycle?.onDispose?.(() => {
+    disposers.push(() => clearInterval(cursorInterval));
+    disposers.push(() => {
       if (leaderTimer) clearTimeout(leaderTimer);
     });
 
     if (options?.updateCheck !== false) {
-      checkForUpdate((opts) => api.ui?.toast?.(opts), api.kv);
+      checkForUpdate(toast, kv);
     }
 
-    // Register all commands via registerLayer (migrated from the deprecated
-    // api.command?.register API). Commands appear in the command palette and
-    // are accessible as slash commands.
-    const exitRun = async () => {
-      setTimeout(() => api.keymap.dispatchCommand("app.exit"), 0);
-    };
-    const exitCommands = ["q", "quit", "wq"].map((cmd) => ({
-      name: `vimcode.${cmd}`,
-      title: `:${cmd}`,
-      category: "Vim",
-      namespace: "palette",
-      desc: cmd === "wq" ? "Exit OpenCode (write and quit)" : "Exit OpenCode",
-      slashName: cmd,
-      run: exitRun,
-    }));
-    const submitRun = async () => {
-      setTimeout(() => api.keymap.dispatchCommand("input.submit"), 0);
-    };
-    const submitCommands = ["w", "write"].map((cmd) => ({
-      name: `vimcode.${cmd}`,
-      title: `:${cmd}`,
-      category: "Vim",
-      namespace: "palette",
-      desc: "Send prompt",
-      slashName: cmd,
-      run: submitRun,
-    }));
-    api.keymap.registerLayer?.({
+    // Shared key path for every bound key. Returns false to let the host
+    // continue dispatch (lower layers / the editor), undefined to consume —
+    // exactly mirroring the V1 intercept's "return vs ctx.consume()".
+    function handleKey(event: V2Context): false | undefined {
+      if (event?.eventType === "release") return false;
+
+      // If vim mode is disabled, pass all keys through unmodified.
+      if (state.disabled) return false;
+
+      // Pass through when any overlay owns the keyboard: dialogs (command
+      // palette, session list, etc.), question prompts, or permission prompts.
+      if (overlayActive()) return false;
+
+      const sid = currentSessionID();
+      if (sid && hasActivePrompts(sid)) {
+        // Consume the leader key so the host keymap doesn't match it as a
+        // leader token, which would enter pending-sequence state instead of
+        // typing a space.
+        const matched = findMatchingLeader(event, leaderKeys);
+        if (matched) {
+          const ch = leaderChar(matched);
+          if (ch) context?.renderer?.currentFocusedEditor?.insertText?.(ch);
+          return undefined;
+        }
+        return false;
+      }
+
+      // Let autocomplete handle Enter/Escape before vim consumes them. V2's
+      // dispatch returns void instead of { ok }, so we can't tell whether the
+      // autocomplete layer was active; returning false lets that layer (which
+      // sits below ours) consume the key when it is.
+      if (state.mode === "insert") {
+        if (event.name === "escape") dispatch("prompt.autocomplete.hide");
+        if (event.name === "return" && !event.ctrl) dispatch("prompt.autocomplete.select");
+      }
+
+      const key = translateKey(event);
+
+      // In normal/visual mode, let the leader key and its follow-up
+      // pass through so OpenCode's leader bindings work.
+      if (leaderKeys.length > 0 && state.mode !== "insert") {
+        if (leaderPending) {
+          leaderPending = false;
+          if (leaderTimer) clearTimeout(leaderTimer);
+          return false;
+        }
+        if (findMatchingLeader(event, leaderKeys)) {
+          leaderPending = true;
+          leaderTimer = setTimeout(() => {
+            leaderPending = false;
+          }, 2000);
+          return false;
+        }
+      }
+
+      const handlerMode = state.mode;
+      const result =
+        state.mode === "insert"
+          ? handleInsertKey(state, key, event, prompt)
+          : state.mode === "visual"
+            ? handleVisualKey(state, key, event, prompt)
+            : handleNormalKey(state, key, event, prompt);
+      if (handlerMode === "normal") finishOneShotIfComplete(state, result);
+
+      // In insert mode, intercept printable leaders (space, "a") so they
+      // insert their character instead of triggering the leader menu
+      // mid-typing. Non-printable leaders (ctrl+x, alt+m) fall through so
+      // app-level shortcuts work without switching modes. Runs after
+      // handleInsertKey so explicit handlers (escape, return, tab, ctrl+o)
+      // take priority. Don't mutate `result` — it may be the shared PASS
+      // constant.
+      let consume = result.consume;
+      let actions = result.actions;
+      if (handlerMode === "insert" && !consume && leaderKeys.length > 0) {
+        const matched = findMatchingLeader(event, leaderKeys);
+        if (matched) {
+          const ch = leaderChar(matched);
+          if (ch) {
+            actions = [{ type: "insertText" as const, text: ch }];
+            consume = true;
+          }
+        }
+      }
+
+      if (!consume) return false;
+      applyActions(actions);
+      return undefined;
+    }
+
+    // ONE global layer at high priority, registered once. Every key the vim
+    // engine can ever handle gets its own command whose run delegates to
+    // handleKey; returning false falls through to the host, so pass-through
+    // semantics survive the intercept → layer migration.
+    const layerConfig = () => ({
+      mode: "global",
+      priority: 10_000,
       commands: [
-        ...exitCommands,
-        ...submitCommands,
+        ...vimKeyCommands(handleKey),
         {
-          name: "vimcode.vim",
+          id: "vimcode.q",
+          title: ":q",
+          group: "Vim",
+          palette: true,
+          slash: { name: "q", aliases: ["quit"] },
+          run: () => {
+            setTimeout(() => dispatch("app.exit"), 0);
+          },
+        },
+        {
+          id: "vimcode.wq",
+          title: ":wq",
+          group: "Vim",
+          palette: true,
+          slash: { name: "wq" },
+          run: () => {
+            setTimeout(() => dispatch("app.exit"), 0);
+          },
+        },
+        {
+          id: "vimcode.w",
+          title: ":w",
+          group: "Vim",
+          palette: true,
+          slash: { name: "w", aliases: ["write"] },
+          run: () => {
+            setTimeout(() => dispatch("input.submit"), 0);
+          },
+        },
+        {
+          id: "vimcode.vim",
           title: ":vim",
-          category: "Vim",
-          namespace: "palette",
-          desc: "Toggle vim mode on/off",
-          slashName: "vim",
-          run: async () => {
+          group: "Vim",
+          palette: true,
+          slash: { name: "vim" },
+          run: () => {
             const result = toggleVimMode(state);
-            await api.kv?.set?.("vimcode.disabled", state.disabled);
+            kv.set("disabled", state.disabled).catch(() => {});
             applyActions(result.actions);
           },
         },
       ],
     });
 
-    api.keymap.intercept(
-      "key",
-      (ctx) => {
-        if (ctx.event.eventType === "release") return;
-
-        // If vim mode is disabled, pass all keys through unmodified.
-        if (state.disabled) return;
-
-        // Pass through when any overlay owns the keyboard: dialogs (command
-        // palette, session list, etc.), question prompts, or permission prompts.
-        if (api.ui?.dialog?.open) return;
-        const route = api.route.current;
-        if (route.name === "session") {
-          const sid = route.params?.sessionID;
-          if (sid && hasActivePrompts(sid)) {
-            // Consume the leader key so dispatchLayers() doesn't
-            // match it as a leader token, which would enter pending-
-            // sequence state instead of typing a space.
-            const matched = findMatchingLeader(ctx.event, leaderKeys);
-            if (matched) {
-              ctx.consume();
-              const ch = leaderChar(matched);
-              if (ch) api.renderer?.currentFocusedEditor?.insertText?.(ch);
-            }
-            return;
-          }
+    // keymap.layer() is "owned by the calling component": it resolves the
+    // keymap provider via useContext, which throws outside the app's
+    // component tree — including in setup(). Registering from a slot render
+    // runs us inside the tree. Slot renders are reactive and may run more
+    // than once, so guard with a flag and never dispose/recreate the layer.
+    let layerRegistered = false;
+    const unregisterSlot = context?.ui?.slot?.({
+      append: "app",
+      render: () => {
+        if (!layerRegistered) {
+          layerRegistered = true;
+          context?.keymap?.layer?.(layerConfig);
         }
-
-        // Let autocomplete handle Enter/Escape before vim consumes them.
-        // dispatchCommand returns { ok } — true when the autocomplete layer
-        // is active and handled the command, false when it's hidden/disabled.
-        if (state.mode === "insert") {
-          if (ctx.event.name === "escape") {
-            const r = api.keymap.dispatchCommand("prompt.autocomplete.hide");
-            if (r.ok) {
-              ctx.consume();
-              return;
-            }
-          }
-          if (ctx.event.name === "return" && !ctx.event.ctrl) {
-            const r = api.keymap.dispatchCommand("prompt.autocomplete.select");
-            if (r.ok) {
-              ctx.consume();
-              return;
-            }
-          }
-        }
-
-        const key = translateKey(ctx.event);
-
-        // In normal/visual mode, let the leader key and its follow-up
-        // pass through so OpenCode's leader bindings work.
-        if (leaderKeys.length > 0 && state.mode !== "insert") {
-          if (leaderPending) {
-            leaderPending = false;
-            if (leaderTimer) clearTimeout(leaderTimer);
-            return;
-          }
-          if (findMatchingLeader(ctx.event, leaderKeys)) {
-            leaderPending = true;
-            leaderTimer = setTimeout(() => {
-              leaderPending = false;
-            }, 2000);
-            return;
-          }
-        }
-
-        const handlerMode = state.mode;
-        const result =
-          state.mode === "insert"
-            ? handleInsertKey(state, key, ctx.event, prompt)
-            : state.mode === "visual"
-              ? handleVisualKey(state, key, ctx.event, prompt)
-              : handleNormalKey(state, key, ctx.event, prompt);
-        if (handlerMode === "normal") finishOneShotIfComplete(state, result);
-
-        // In insert mode, intercept printable leaders (space, "a") so
-        // they insert their character instead of triggering the leader
-        // menu mid-typing. Non-printable leaders (ctrl+x, alt+m) fall
-        // through to dispatchLayers() so app-level shortcuts work
-        // without switching modes. Runs after handleInsertKey so
-        // explicit handlers (escape, return, tab, ctrl+o) take priority.
-        // Don't mutate `result` — it may be the shared PASS constant.
-        let consume = result.consume;
-        let actions = result.actions;
-        if (handlerMode === "insert" && !consume && leaderKeys.length > 0) {
-          const matched = findMatchingLeader(ctx.event, leaderKeys);
-          if (matched) {
-            const ch = leaderChar(matched);
-            if (ch) {
-              actions = [{ type: "insertText" as const, text: ch }];
-              consume = true;
-            }
-          }
-        }
-
-        if (consume) ctx.consume();
-        applyActions(actions);
+        return null;
       },
-      { priority: 10_000 },
-    );
+    });
+    if (typeof unregisterSlot === "function") disposers.push(unregisterSlot);
+
+    return () => {
+      for (const off of disposers) {
+        try {
+          off();
+        } catch {}
+      }
+    };
   },
 };
+
+// All printable ASCII plus the special keys the engine handles. One command
+// per base key: shifted variants (shift+a → "A") are normalized by
+// translateKey before the engine sees them.
+const SPECIAL_KEYS = ["escape", "return", "tab", "backspace", "delete", "left", "right", "up", "down", "home", "end"];
+
+function keyCommandId(key: string): string {
+  // IDs are also config keybind identifiers; keep punctuation out of them.
+  return /^[_a-zA-Z0-9]+$/.test(key) ? `vimcode.key.${key}` : `vimcode.key.c${key.charCodeAt(0)}`;
+}
+
+type KeyCommand = {
+  id: string;
+  title: string;
+  group: string;
+  bind: string;
+  /* biome-ignore lint/suspicious/noExplicitAny: plugin-API seam, host-owned types */
+  run: (input: unknown, event: any) => false | undefined;
+};
+
+function vimKeyCommands(handleKey: (event: V2Context) => false | undefined): KeyCommand[] {
+  const binds: string[] = [];
+  for (let i = 33; i <= 126; i++) binds.push(String.fromCharCode(i));
+  binds.push("space", ...SPECIAL_KEYS);
+  return binds.map((bind) => ({
+    id: keyCommandId(bind),
+    title: `Vim: ${bind}`,
+    group: "Vim",
+    bind,
+    run: (_input: unknown, event: V2Context) => handleKey(event),
+  }));
+}
+
+// Read all configured leader keys from OpenCode's global CLI config. The V1
+// api.tuiConfig.keybinds accessor has no documented V2 equivalent, so we read
+// cli.json directly and degrade to "no leader pass-through" on any failure.
+function resolveLeaderKeys(): KeyLike[] {
+  try {
+    const xdg = process.env.XDG_CONFIG_HOME;
+    const file = xdg ? path.join(xdg, "opencode", "cli.json") : path.join(homedir(), ".config", "opencode", "cli.json");
+    const config = JSON.parse(readFileSync(file, "utf8"));
+    const raw = config?.keybinds?.leader;
+    const entries: unknown[] = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
+    return entries
+      .map((e) => (typeof e === "object" && e !== null ? (e as { key?: unknown }).key : e))
+      .filter(
+        (k): k is KeyLike =>
+          !!k &&
+          k !== "none" &&
+          k !== "false" &&
+          (typeof k === "string" || (typeof k === "object" && typeof (k as Record<string, unknown>).name === "string")),
+      );
+  } catch {
+    return [];
+  }
+}
 
 function offsetToLineCol(text: string, offset: number): [number, number] {
   const before = text.substring(0, offset);

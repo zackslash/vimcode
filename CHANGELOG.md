@@ -8,6 +8,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 
 ## [Unreleased]
 
+### Changed
+
+- Ported the plugin from the V1 TUI plugin API (`tui(api, options)` + key intercepts) to the V2 API (`setup(context)` + reactive keymap layers) so it loads in OpenCode v2. One global layer at priority 10000 binds every key the engine can handle; each command's `run` delegates to a single handler that returns `false` to pass keys through or consumes them, preserving the V1 intercept semantics (disabled state, overlay passthrough, leader pass-through, one-shot normal, insert-mode printable-leader interception).
+- Migrated V1 API calls to their V2 equivalents: `api.kv` → a small async kv shim over `context.storage.store` (durable store `"vimcode"`), `api.ui.toast` → `context.ui.toast.show`, `api.route.current` → `context.ui.router.current`, `api.state.session.*` → `context.data.session.get`/`form.list`/`permission.list`, `api.event.on` → `context.data.listen` catch-all (matching `/^(permission|question|form)\./`, with `data.on` fallback), `api.keymap.dispatchCommand` → `context.keymap.dispatch` (still deferred via `setTimeout`), and `api.lifecycle.onDispose` → a single cleanup function returned from `setup()`.
+- Leader keys are now read directly from OpenCode's global CLI config (`$XDG_CONFIG_HOME/opencode/cli.json` or `~/.config/opencode/cli.json`, `keybinds.leader`), since `api.tuiConfig.keybinds` has no V2 equivalent. Resolution failure degrades to no leader pass-through.
+- Overlay detection now uses `context.keymap.mode.current()`: only a positively-identified non-default mode is treated as an overlay; `undefined`/unknown values keep vim handling.
+- The keymap layer is registered from a no-op `ui.slot` render (`append: "app"`, once, guarded) instead of `setup()`: `keymap.layer()` resolves the keymap provider via Solid `useContext` and throws "Keymap.Provider is missing" outside the app's component tree. `keymap.dispatch` and `keymap.mode.current` are guarded the same way at call time.
+
+### Known gaps
+
+- Autocomplete disambiguation is best-effort: V2's `keymap.dispatch` returns `void` instead of `{ ok }`, so in insert mode Escape/Enter always dispatch `prompt.autocomplete.*` and then fall through; the autocomplete layer consumes the key when it is active.
+- Motion/delete commands (`input.move.*`, `input.delete.*`, `input.undo`, `app.exit`, `input.submit`) are still dispatched by command ID; if the host renames these they fail silently. The engine was not rewritten to direct editor-widget calls in this port.
+
 ## [0.18.1] — 2026-09-11
 
 ### Changed

@@ -6,12 +6,11 @@ vimcode is a TUI plugin for [OpenCode](https://opencode.ai). Before working on i
 
 **References (read these, don't guess):**
 - Official plugin docs: https://opencode.ai/docs/plugins/
-- TUI plugin spec: https://github.com/sst/opencode/blob/dev/packages/opencode/specs/tui-plugins.md
-- Plugin types: `@opencode-ai/plugin/tui` exports `TuiPluginModule`, `TuiPluginApi`
+- V2 plugin types: `@opencode/plugin/tui` exports `Plugin` (`define`, `Definition`, `Cleanup`, `Context`). We do NOT import it at runtime — the host intercepts that specifier, and its type graph pulls in `@opentui/*`/`solid-js` packages that must stay out of `node_modules`. The seam is self-typed in `src/index.ts` with the context as `any`.
 - A good reference TUI plugin with slots/keymap/routes: [opencode-workspaces](https://github.com/stephengolub/opencode-workspaces)
 
-**Plugin API surface** (`api: TuiPluginApi`):
-`keymap` (register layers, intercepts, dispatch commands), `slots` (register UI into named slots), `ui` (toasts, dialogs), `theme` (colors), `prompt` (read/write prompt text), `state` (session, config), `client` (SDK), `lifecycle` (disposal), `kv` (persistent storage), `route` (custom screens).
+**Plugin API surface** (V2, `context: Plugin.Context`):
+`options` (plugin options), `storage` (durable `store()` / ephemeral `memory()` → `[Store, mutate]`), `data` (session/forms/permissions + `on`/`listen` events), `keymap` (`layer()` for reactive command layers, `dispatch()`, `mode`), `ui` (toast/dialog/router/panel/tabs/slots), `renderer` (CliRenderer, incl. `currentFocusedEditor`), `theme`, `client`, `app`. `setup()` returns a cleanup function.
 
 **Gotchas we hit during development:**
 - TUI plugins go in `tui.json`, not `opencode.json`. The config field is `"plugin"`.
@@ -24,6 +23,17 @@ vimcode is a TUI plugin for [OpenCode](https://opencode.ai). Before working on i
 - **SolidJS/JSX still does not work in cache-installed plugins.** Last reproduced on 2026-09-08 with OpenCode 1.18.21 using an npm-source tarball. A plain `.ts` entry and its TUI hook loaded, but importing a `.tsx` module with `/** @jsxImportSource @opentui/solid */` failed with `Cannot find module '@opentui/solid/jsx-dev-runtime'`. The Solid transform excludes files under `node_modules`; the runtime prescan therefore cannot see the JSX-generated import before Bun resolves it. OpenCode 1.18.25 has identical relevant runtime code and also pins OpenTUI 0.4.5. OpenTUI 0.5.9 retains the exclusion. Until upstream changes this path, avoid JSX and `solid-js` imports in distributed plugins. Use `api.ui.toast()` for mode feedback instead of slot indicators. See [#3](https://github.com/oribarilan/vimcode/issues/3).
 - **Do NOT add `solid-js`, `@opentui/solid`, or `@opentui/core` as dependencies or peerDependencies.** If they're in `package.json`, Bun installs them into the plugin's `node_modules/`, and the local `.d.ts` stubs shadow the host's runtime module intercepts. The host provides these at runtime via `ensureRuntimePluginSupport`. Keep them only in `devDependencies` (via `@opencode-ai/plugin` which pulls them in for type-checking).
 - **Test distributed plugin behavior through the package cache.** `dev-tui.json` uses `"plugin": ["."]`, which loads from the working tree and does not reproduce cache-only module resolution failures. Use an npm-source tarball spec such as `name@file:/absolute/path/package.tgz` or the real `git+https://...#ref` install form, and clear only that package's cache entry before retesting.
+
+### V2 keymap-layer design (replaces intercepts)
+
+V2 has no raw key intercepts. The plugin registers ONE global keymap layer at priority 10000 in `setup()` — never re-registered. Every key the engine can ever handle (all printable ASCII plus escape/return/tab/backspace/delete/arrows/home/end) gets its own generated command (`vimcode.key.*`); each `run(input, event)` delegates to one shared `handleKey(event)`. A `run` returning `false` continues host dispatch (full pass-through), anything else consumes — this mirrors the V1 `ctx.consume()` semantics exactly. `:q/:wq/:w/:vim` palette + slash commands ride the same layer. All V1 pass-through rules live in `handleKey` in the same order: releases → disabled → overlay (`keymap.mode.current()`, only a positively-identified non-default mode counts) → session prompts (router sessionID + form/permission lists + child-prompt event aggregation) → insert-mode autocomplete dispatch → leader pass-through (normal/visual) → engine handlers → insert-mode printable-leader interception.
+
+V2 specifics to remember:
+- **`keymap.layer()` must be called from inside a slot render.** The keymap bridge resolves its provider with Solid `useContext` and throws "Keymap.Provider is missing" when called from `setup()` (outside the component tree). The plugin claims a no-op slot (`append: "app"`, `render` returns `null`) and registers the layer there once, guarded by a flag (slot renders are reactive and can run multiple times — never dispose/recreate). `keymap.dispatch` and `keymap.mode.current` are wrapped in try/catch for the same reason; other surfaces (ui/storage/router/renderer/data) are host services and need no guarding.
+- `context.storage.store(name, { initial })` returns `[Store, mutate]`; `mutate((draft) => {...})` is the write path. `src/index.ts` wraps it in a tiny async kv shim so `version.ts` and the disabled flag keep their get/set shape.
+- `keymap.dispatch(id)` returns `void` (no `{ ok }`), so insert-mode autocomplete handling dispatches `prompt.autocomplete.*` and falls through instead of conditionally consuming.
+- Leader keys come from the global CLI config (`$XDG_CONFIG_HOME/opencode/cli.json` else `~/.config/opencode/cli.json`, `keybinds.leader`), read once at setup; `api.tuiConfig` no longer exists.
+- Events: prefer `context.data.listen` (catch-all, matched against `/^(permission|question|form)\./` with `+1` on `*.asked|*.created` and `-1` on `*.replied|*.rejected|*.answered`) over `data.on` — event names are still settling and double-subscription would double-count prompts. Falls back to explicit `data.on` types when `listen` is absent.
 
 ### Editor widget API
 
@@ -58,7 +68,7 @@ This API surface makes text objects (`ciw`, `di"`), direct cursor manipulation, 
 
 ```
 src/
-  index.ts       (414 lines)  Plugin entry: intercept registration, action application
+  index.ts       (582 lines)  Plugin entry: V2 setup(), slot-scoped keymap layer registration, action application
   vim/                        Pure vim engine (thin barrel re-exports the public surface):
     index.ts     (7 lines)    Barrel — public surface only. No export *, no internals.
     types.ts     (57 lines)   Action union, VimState, Mode, Operator, Pending, Range, KeyEvent, HandlerResult, PromptAccess
@@ -72,7 +82,7 @@ src/
     visual.ts    (104 lines)  handleVisualKey
   leader.ts      (73 lines)   Leader key matching: matchesKeyLike, findMatchingLeader, leaderChar
   clipboard.ts   (19 lines)   writeClipboard() — cross-platform (pbcopy/xclip/xsel/wl-copy/clip.exe)
-  version.ts     (46 lines)   Version constant, GitHub update check (cached daily)
+  version.ts     (49 lines)   Version constant, GitHub update check (cached daily)
 test/
   support.ts     (33 lines)   Shared assertion helpers + ev()
   fixtures.ts    (17 lines)   Prompt fixtures: mockPrompt, emptyPrompt
@@ -84,7 +94,7 @@ test/
     normal.test.ts   (823)    handleNormalKey branches
     visual.test.ts   (287)    handleVisualKey branches
     textobject.test.ts (64)   resolveTextObject dispatch seam
-  integration.test.ts (579)   Full pipeline: one-shot normal, plugin init, undo snapshots, version sync, prompt overlay tracking
+  integration.test.ts (563)   Full pipeline: V2 mock context + setup(), one-shot normal, undo snapshots, version sync, prompt overlay tracking
   leader.test.ts (125 lines)  Unit tests for leader key matching functions
 ```
 

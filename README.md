@@ -22,11 +22,13 @@
 
 ## Install
 
-Add to your `tui.json` (or `.opencode/tui.json`):
+Add to your `opencode.json` (or `~/.config/opencode/opencode.json`) under `plugins` — OpenCode v2 config form:
 
 ```json
 {
-  "plugin": ["vimcode@git+https://github.com/oribarilan/vimcode.git#v0.18.1"]
+  "plugins": [
+    { "package": "vimcode@git+https://github.com/oribarilan/vimcode.git#v0.19.0" }
+  ]
 }
 ```
 
@@ -36,11 +38,16 @@ You'll see a toast when a newer version is available (can be turned off).
 
 ## Configuration
 
-To pass options, use the tuple form in `tui.json`:
+To pass options, nest them next to `package`:
 
 ```json
 {
-  "plugin": [["vimcode@git+https://github.com/oribarilan/vimcode.git#v0.18.1", { "updateCheck": false }]]
+  "plugins": [
+    {
+      "package": "vimcode@git+https://github.com/oribarilan/vimcode.git#v0.19.0",
+      "options": { "updateCheck": false }
+    }
+  ]
 }
 ```
 
@@ -68,13 +75,13 @@ First Escape in insert mode switches to normal - it won't trigger OpenCode's dou
 
 ### Leader key
 
-vimcode reads OpenCode's leader key from your `tui.json` keybinds and handles it automatically, no plugin-side config needed.
+vimcode reads OpenCode's leader key from your OpenCode CLI config (`$XDG_CONFIG_HOME/opencode/cli.json` or `~/.config/opencode/cli.json`) and handles it automatically, no plugin-side config needed.
 
 In **normal and visual mode**, the leader key and the follow-up key pass straight through to OpenCode, so leader shortcuts (`<leader>c` for copy, etc.) work as expected.
 
 In **insert mode**, printable leaders (like space) insert their character. Non-printable leaders (like `ctrl+x`) pass through to OpenCode, so leader shortcuts work from any mode.
 
-This allows, for example, to use the popular vim-style `space` leader, set it in your `tui.json`:
+This allows, for example, to use the popular vim-style `space` leader, set it in your `cli.json`:
 
 ```json
 {
@@ -202,12 +209,13 @@ All normal-mode motions work for extending the selection: `h` `j` `k` `l` `w` `b
 
 - `Ctrl+v` - block visual mode is not supported
 - No persistent mode indicator - the toast fades after about a second. A cache-installed JSX slot still fails to resolve `@opentui/solid/jsx-dev-runtime`; last reproduced on 2026-09-08 with OpenCode 1.18.21. OpenCode 1.18.25 uses the same relevant runtime code and OpenTUI version ([#3](https://github.com/oribarilan/vimcode/issues/3)).
+- Motion/delete commands (`input.move.*`, `input.delete.*`) are dispatched by command ID. If the host ever drops or renames these IDs they will fail silently — the port kept the ID-based dispatch instead of rewriting the engine to direct editor-widget calls.
 
 Configurable key bindings are next once the core vim coverage stabilizes.
 
 ## How it works
 
-vimcode registers a key intercept on every prompt keypress. A pure handler in `src/vim.ts` takes the current mode and key, returns a list of actions (move cursor, delete word, switch mode, etc.) without touching the plugin API. `src/index.ts` applies those actions through `@opentui/keymap` commands.
+vimcode registers one high-priority reactive keymap layer. A pure handler in `src/vim/` takes the current mode and key, returns a list of actions (move cursor, delete word, switch mode, etc.) without touching the plugin API. `src/index.ts` applies those actions through OpenCode commands.
 
 ## Contributing
 
