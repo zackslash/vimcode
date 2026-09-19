@@ -236,6 +236,8 @@ function createMockContext(init: {
   let layer: (() => MockLayer) | undefined;
   const store: Record<string, unknown> = {};
   const sessions = init.sessions ?? {};
+  const slotCalls = { count: 0 };
+  const layerCalls = { count: 0 };
   let mode = init.mode ?? "base";
 
   const ctx = {
@@ -256,15 +258,18 @@ function createMockContext(init: {
         },
       },
       router: { current: () => init.route ?? { type: "home" } },
-      // Simulates a mount: the plugin registers its keymap layer from inside
-      // the slot render (keymap.layer requires the in-tree provider).
+      // Simulates a mount: the plugin claims the slot and the render returns
+      // a component element; invoking render mounts the component, which is
+      // what registers the keymap layer (blessed v2.0.8 pattern).
       slot: (claim: { render: (input: unknown) => unknown }) => {
+        slotCalls.count += 1;
         claim.render({});
         return () => {};
       },
     },
     keymap: {
       layer: (fn: () => MockLayer) => {
+        layerCalls.count += 1;
         layer = fn;
       },
       mode: { current: () => mode },
@@ -322,7 +327,7 @@ function createMockContext(init: {
 
   const layerConfig = () => layer?.();
 
-  return { ctx, dispatched, toasts, events, load, press, emit, setMode, layerConfig };
+  return { ctx, dispatched, toasts, events, load, press, emit, setMode, layerConfig, slotCalls, layerCalls };
 }
 
 // ── plugin init sanity check ──────────────────────────────
@@ -580,6 +585,21 @@ describe("modifier combos and layer gating", () => {
 
     mock.setMode("base");
     expect(mock.press("j")).toBe(true);
+  });
+
+  it("claims the slot once and registers the layer once per mount", async () => {
+    const mock = createMockContext({ editor: undefined, options: { updateCheck: false } });
+    await mock.load();
+    // setup() claims the slot exactly once; the component body (one mount)
+    // registers the layer exactly once.
+    expect(mock.slotCalls.count).toBe(1);
+    expect(mock.layerCalls.count).toBe(1);
+  });
+
+  it("emits the TEMP-VERIFY setup toast", async () => {
+    const mock = createMockContext({ editor: undefined, options: { updateCheck: false } });
+    await mock.load();
+    expect(mock.toasts).toContain("vimcode: setup");
   });
 
   it("the /vim toggle makes key commands pass through and palette commands no-op", async () => {

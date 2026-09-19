@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { writeClipboard } from "./clipboard";
+import { registerCommandsSlot, type V2Context } from "./commands";
 import { findMatchingLeader, type KeyLike, leaderChar } from "./leader";
 import { checkForUpdate } from "./version";
 import {
@@ -15,14 +16,11 @@ import {
   translateKey,
 } from "./vim";
 
-// V2 plugin seam. The official types live in @opencode/plugin/tui, whose type
-// graph pulls in @opentui/core and solid-js — packages the host provides at
-// runtime and that must NOT be installed into the plugin (local stubs would
-// shadow the host's module intercepts). The context is therefore typed as
-// `any` and every access is defensive (`?.`), same as the V1 api seam.
-/* biome-ignore lint/suspicious/noExplicitAny: plugin-API seam, host-owned types */
-type V2Context = any;
-
+// The official plugin types live in @opencode/plugin/tui, whose type graph
+// pulls in @opentui/core and solid-js — packages the host provides at runtime
+// and that must NOT be installed into the plugin (local stubs would shadow the
+// host's module intercepts). The context is therefore typed as `any` (see
+// commands.tsx) and every access is defensive, same as the V1 api seam.
 type V2Plugin = { id: string; setup: (context: V2Context) => (() => void) | undefined };
 
 // The host injects @opencode/plugin/tui and Plugin.define is identity, so a
@@ -532,26 +530,24 @@ const plugin: V2Plugin = {
       ],
     });
 
-    // keymap.layer() is "owned by the calling component": it resolves the
-    // keymap provider via useContext, which throws outside the app's
-    // component tree — including in setup(). Registering from a slot render
-    // runs us inside the tree. Slot renders are reactive and may run more
-    // than once, so guard with a flag and never dispose/recreate the layer.
-    let layerRegistered = false;
-    const unregisterSlot = context?.ui?.slot?.({
-      append: "app",
-      render: () => {
-        if (!layerRegistered) {
-          layerRegistered = true;
-          // Calibrate the baseline from inside the tree, where the provider
-          // is guaranteed to resolve.
-          baselineMode = safeModeCurrent();
-          context?.keymap?.layer?.(layerConfig);
-        }
-        return null;
+    // keymap.layer() resolves Solid/OpenTUI hooks against the calling
+    // component; called from a bare slot-render callback it dies silently
+    // (setup "completes" with zero commands and zero errors — the exact
+    // failure this port hit). The blessed pattern from the v2.0.8 feature
+    // plugins (system/plugins.tsx) returns a component element from the
+    // render callback, so the hook work happens inside the component body.
+    // TEMP-VERIFY: screen-capture signal that setup ran. Removed in a
+    // follow-up commit after runtime verification.
+    context?.ui?.toast?.show?.({ message: "vimcode: setup", variant: "info", duration: 1000 });
+    registerCommandsSlot({
+      context,
+      layerConfig,
+      safeModeCurrent,
+      onRegistered: (baseline) => {
+        baselineMode = baseline;
       },
+      onUnregister: (off) => disposers.push(off),
     });
-    if (typeof unregisterSlot === "function") disposers.push(unregisterSlot);
 
     return () => {
       for (const off of disposers) {

@@ -30,8 +30,10 @@ V2 has no raw key intercepts. The plugin registers ONE global keymap layer at pr
 
 V2 specifics to remember:
 - **Binds are exact-match.** The layer only sees events matching a bound key, so modifier combos the engine consumes must be bound explicitly (`ctrl+return`, `ctrl+o` in `MODIFIER_BINDS`). Normal/visual handlers PASS on any ctrl, so all other ctrl combos stay unbound and fall through to host bindings.
-- **Gating must be dispatch-time only — never reactive `enabled`.** v2.0.8 silently registers NOTHING when a command carries function-valued `enabled` (type says `boolean | (() => boolean)`; runtime disagrees). Overlay handling therefore lives in `handleKey`: the baseline input mode is captured via `keymap.mode.current()` at slot-render registration time, and when the live mode differs (dialogs, custom modes), `handleKey` returns `false` so the overlay's layers receive the key (undeterminable mode ⇒ vim stays active). Do NOT use layer-level `enabled` either: the palette lists only currently-reachable commands and pushes a foreign mode while open, so it would hide `:q`/`:wq`/`:w`//vim` exactly when shown. Palette/slash commands carry no gating in their registration at all; their `run()` no-ops while the /vim toggle (`state.disabled`) is off.
-- **`keymap.layer()` must be called from inside a slot render.** The keymap bridge resolves its provider with Solid `useContext` and throws "Keymap.Provider is missing" when called from `setup()` (outside the component tree). The plugin claims a no-op slot (`append: "app"`, `render` returns `null`) and registers the layer there once, guarded by a flag (slot renders are reactive and can run multiple times — never dispose/recreate). `keymap.dispatch` and `keymap.mode.current` are wrapped in try/catch for the same reason; other surfaces (ui/storage/router/renderer/data) are host services and need no guarding.
+- **The slot render must return a component ELEMENT** (blessed pattern from the v2.0.8 feature plugins, `packages/tui/src/feature-plugins/system/plugins.tsx`): `ui.slot({ append: "app", render: () => <Commands … /> })`, with `keymap.layer()` called in the component body. A bare render callback that does the work and returns null dies silently — the keymap hooks resolve against the calling component, and a bare callback has no owner, so setup "completes" with zero commands and zero errors. `src/commands.tsx` owns the component + slot claim; the baseline input mode is captured inside the component body where the provider is guaranteed. No mount guard: a Solid component body runs once per mount.
+- **Gating must be dispatch-time only — never reactive `enabled`.** v2.0.8 silently registers NOTHING when a command carries function-valued `enabled` (type says `boolean | (() => boolean)`; runtime disagrees). Overlay handling therefore lives in `handleKey`: the baseline input mode is captured via `keymap.mode.current()` at component-mount time, and when the live mode differs (dialogs, custom modes), `handleKey` returns `false` so the overlay's layers receive the key (undeterminable mode ⇒ vim stays active). Do NOT use layer-level `enabled` either: the palette lists only currently-reachable commands and pushes a foreign mode while open, so it would hide `:q`/`:wq`/`:w`//vim` exactly when shown. Palette/slash commands carry no gating in their registration at all; their `run()` no-ops while the /vim toggle (`state.disabled`) is off.
+- **De-silence the host seam.** `ui.slot` and `keymap.layer` are called directly with explicit `console.error("[vimcode] host API missing: …")` guards — a missing member must be loud, not a silent no-op that looks like a successful load.
+- **`keymap.layer()` must be called from inside a mounted component.** The keymap bridge resolves its provider with Solid hooks and fails when called from `setup()` (outside the component tree) — see the component-element note above. `keymap.dispatch` and `keymap.mode.current` are wrapped in try/catch for the same reason; other surfaces (ui/storage/router/renderer/data) are host services and need no guarding.
 - `context.storage.store(name, { initial })` returns `[Store, mutate]`; `mutate((draft) => {...})` is the write path. `src/index.ts` wraps it in a tiny async kv shim so `version.ts` and the disabled flag keep their get/set shape.
 - `keymap.dispatch(id)` returns `void` (no `{ ok }`), so insert-mode autocomplete handling dispatches `prompt.autocomplete.*` and falls through instead of conditionally consuming.
 - Leader keys come from the global CLI config (`$XDG_CONFIG_HOME/opencode/cli.json` else `~/.config/opencode/cli.json`, `keybinds.leader`), read once at setup; `api.tuiConfig` no longer exists.
@@ -70,7 +72,8 @@ This API surface makes text objects (`ciw`, `di"`), direct cursor manipulation, 
 
 ```
 src/
-  index.ts       (632 lines)  Plugin entry: V2 setup(), slot-scoped keymap layer registration, action application
+  index.ts       (628 lines)  Plugin entry: V2 setup(), action application (layer registration lives in commands.tsx)
+  commands.tsx   (63 lines)   Slot claim + Commands component — the only JSX; keymap.layer() runs in the component body
   vim/                        Pure vim engine (thin barrel re-exports the public surface):
     index.ts     (7 lines)    Barrel — public surface only. No export *, no internals.
     types.ts     (57 lines)   Action union, VimState, Mode, Operator, Pending, Range, KeyEvent, HandlerResult, PromptAccess
@@ -96,7 +99,7 @@ test/
     normal.test.ts   (823)    handleNormalKey branches
     visual.test.ts   (287)    handleVisualKey branches
     textobject.test.ts (64)   resolveTextObject dispatch seam
-  integration.test.ts (662)   Full pipeline: V2 mock context + setup(), one-shot normal, undo snapshots, version sync, prompt overlay tracking, modifier binds + dispatch-time gating
+  integration.test.ts (682)   Full pipeline: V2 mock context + setup(), one-shot normal, undo snapshots, version sync, prompt overlay tracking, modifier binds + dispatch-time gating
   leader.test.ts (125 lines)  Unit tests for leader key matching functions
 ```
 
