@@ -23,7 +23,9 @@ function VimLayer(props: any) {
   props.context.keymap.layer(props.layerConfig);
   try {
     const reachable = props.context.keymap.commands();
-    const ours = reachable.filter((c: { id?: string }) => String(c?.id ?? "").startsWith("vimcode")).length;
+    const ours = reachable.filter((c: { id?: string; name?: string }) =>
+      String(c?.name ?? c?.id ?? "").startsWith("vimcode"),
+    ).length;
     props.toast(`vimcode: ${ours}/${reachable.length} cmds`);
   } catch (error) {
     props.toast(`vimcode: cmds err ${String(error).slice(0, 40)}`);
