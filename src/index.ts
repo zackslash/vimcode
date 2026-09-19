@@ -155,7 +155,10 @@ const plugin: V2Plugin = {
     function currentSessionID(): string | undefined {
       const route = context?.ui?.router?.current?.();
       if (!route) return undefined;
-      if (route.type === "session") return route.sessionID;
+      // V2 routes are a discriminated union on `type`; read `name` as a
+      // defensive fallback in case a host ships the V1-ish shape.
+      const kind = route.type ?? route.name;
+      if (kind === "session") return route.sessionID;
       return typeof route.sessionID === "string" ? route.sessionID : undefined;
     }
 
@@ -190,6 +193,32 @@ const plugin: V2Plugin = {
             (mode as { mode?: unknown }).mode)
           : undefined;
       return typeof name === "string" ? !NON_OVERLAY_MODES.has(name) : false;
+    }
+
+    // Reads the current input mode; undefined when it can't be determined
+    // (missing, non-string, or the provider lookup throws outside the tree).
+    function safeModeCurrent(): string | undefined {
+      try {
+        const mode = context?.keymap?.mode?.current?.();
+        return typeof mode === "string" ? mode : undefined;
+      } catch {
+        return undefined;
+      }
+    }
+
+    // Baseline input mode captured when the layer registers. Foreign input
+    // modes (dialogs, custom modes) then disable the whole layer reactively
+    // via `enabled`, so overlays whose key handling doesn't outrank ours
+    // still get their keys. Self-calibrating: if no baseline could be read,
+    // the layer stays always-enabled (the per-key checks remain the backstop).
+    let baselineMode: string | undefined;
+    function vimLayerActive(): boolean {
+      if (baselineMode === undefined) return true;
+      const mode = safeModeCurrent();
+      // Throwing/undeterminable mode: keep vim handling rather than
+      // permanently bricking the layer.
+      if (mode === undefined) return true;
+      return mode === baselineMode;
     }
 
     // Snapshots for single-step undo of vim changes.
@@ -442,6 +471,11 @@ const plugin: V2Plugin = {
     const layerConfig = () => ({
       mode: "global",
       priority: 10_000,
+      // Layer-level gate: disabled while the /vim toggle is off or while the
+      // input mode differs from the baseline captured at registration
+      // (foreign input modes = overlays own the keyboard). Composes with the
+      // per-key checks in run(), which remain as a backstop.
+      enabled: () => !state.disabled && vimLayerActive(),
       commands: [
         ...vimKeyCommands(handleKey),
         {
@@ -500,6 +534,9 @@ const plugin: V2Plugin = {
       render: () => {
         if (!layerRegistered) {
           layerRegistered = true;
+          // Calibrate the baseline from inside the tree, where the provider
+          // is guaranteed to resolve.
+          baselineMode = safeModeCurrent();
           context?.keymap?.layer?.(layerConfig);
         }
         return null;
@@ -519,12 +556,16 @@ const plugin: V2Plugin = {
 
 // All printable ASCII plus the special keys the engine handles. One command
 // per base key: shifted variants (shift+a → "A") are normalized by
-// translateKey before the engine sees them.
+// translateKey before the engine sees them. Binds are exact-match, so the two
+// modifier combos the engine consumes (ctrl+return → submit, ctrl+o → one-shot
+// normal) must be bound explicitly; all other ctrl combos must stay unbound so
+// they fall through to host bindings.
 const SPECIAL_KEYS = ["escape", "return", "tab", "backspace", "delete", "left", "right", "up", "down", "home", "end"];
+const MODIFIER_BINDS = ["ctrl+return", "ctrl+o"];
 
 function keyCommandId(key: string): string {
   // IDs are also config keybind identifiers; keep punctuation out of them.
-  return /^[_a-zA-Z0-9]+$/.test(key) ? `vimcode.key.${key}` : `vimcode.key.c${key.charCodeAt(0)}`;
+  return `vimcode.key.${key.replace(/[^_a-zA-Z0-9]/g, "-")}`;
 }
 
 type KeyCommand = {
@@ -539,7 +580,7 @@ type KeyCommand = {
 function vimKeyCommands(handleKey: (event: V2Context) => false | undefined): KeyCommand[] {
   const binds: string[] = [];
   for (let i = 33; i <= 126; i++) binds.push(String.fromCharCode(i));
-  binds.push("space", ...SPECIAL_KEYS);
+  binds.push("space", ...SPECIAL_KEYS, ...MODIFIER_BINDS);
   return binds.map((bind) => ({
     id: keyCommandId(bind),
     title: `Vim: ${bind}`,

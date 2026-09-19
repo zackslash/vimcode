@@ -16,6 +16,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 - Overlay detection now uses `context.keymap.mode.current()`: only a positively-identified non-default mode is treated as an overlay; `undefined`/unknown values keep vim handling.
 - The keymap layer is registered from a no-op `ui.slot` render (`append: "app"`, once, guarded) instead of `setup()`: `keymap.layer()` resolves the keymap provider via Solid `useContext` and throws "Keymap.Provider is missing" outside the app's component tree. `keymap.dispatch` and `keymap.mode.current` are guarded the same way at call time.
 
+### Fixed
+
+- Insert-mode Ctrl+Enter submits again: V2 binds are exact-match, so the two modifier combos the engine consumes (`ctrl+return` → submit, `ctrl+o` → one-shot normal) are now explicitly bound in the generated keymap layer. All other ctrl combos remain unbound and fall through to host bindings.
+- Permission/question prompts are navigable again: the layer now disables itself reactively whenever the active input mode differs from the baseline captured at registration (foreign input modes = an overlay owns the keyboard), and the router session check reads the V2 discriminated union (`route.type === "session"`, with `route.name` as a defensive fallback).
+
 ### Known gaps
 
 - Autocomplete disambiguation is best-effort: V2's `keymap.dispatch` returns `void` instead of `{ ok }`, so in insert mode Escape/Enter always dispatch `prompt.autocomplete.*` and then fall through; the autocomplete layer consumes the key when it is active.

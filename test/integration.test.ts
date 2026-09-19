@@ -227,13 +227,16 @@ function createMockContext(init: {
   route?: { type: string; sessionID?: string };
   mode?: string;
   sessions?: Record<string, { parentID?: string }>;
+  permissions?: unknown[];
 }) {
   const dispatched: string[] = [];
+  const toasts: string[] = [];
   const events = new Map<string, (e: unknown) => void>();
   let listener: ((e: { details: Record<string, unknown> }) => void) | undefined;
   let layer: (() => MockLayer) | undefined;
   const store: Record<string, unknown> = {};
   const sessions = init.sessions ?? {};
+  let mode = init.mode ?? "base";
 
   const ctx = {
     options: init.options ?? {},
@@ -247,7 +250,11 @@ function createMockContext(init: {
       ],
     },
     ui: {
-      toast: { show: () => {} },
+      toast: {
+        show: (opts: { message: string }) => {
+          toasts.push(opts.message);
+        },
+      },
       router: { current: () => init.route ?? { type: "home" } },
       // Simulates a mount: the plugin registers its keymap layer from inside
       // the slot render (keymap.layer requires the in-tree provider).
@@ -260,7 +267,7 @@ function createMockContext(init: {
       layer: (fn: () => MockLayer) => {
         layer = fn;
       },
-      mode: { current: () => init.mode ?? "base" },
+      mode: { current: () => mode },
       dispatch: (id: string) => {
         dispatched.push(id);
       },
@@ -279,7 +286,7 @@ function createMockContext(init: {
       session: {
         get: (id: string) => sessions[id],
         form: { list: () => [] },
-        permission: { list: () => [] },
+        permission: { list: () => init.permissions ?? [] },
       },
     },
     renderer: { currentFocusedEditor: init.editor },
@@ -294,10 +301,14 @@ function createMockContext(init: {
   };
 
   // Drives the one shared key command: every bound key's run delegates to
-  // the same handleKey, so any bind works. Returns whether it consumed.
+  // the same handleKey, so any bind works. Respects the layer's `enabled`
+  // gate (disabled layer = the host never dispatches to it → pass through).
+  // Returns whether it consumed.
   const press = (name: string, opts: Record<string, boolean> = {}) => {
-    const cmd = layer?.()?.commands?.find((c) => c.bind !== undefined);
+    const cfg = layer?.();
+    const cmd = cfg?.commands?.find((c) => c.bind !== undefined);
     if (!cmd) throw new Error("no keymap layer registered");
+    if (typeof cfg.enabled === "function" && cfg.enabled() === false) return false;
     const result = cmd.run(undefined, { name, eventType: "press", ...opts });
     return result !== false;
   };
@@ -307,7 +318,13 @@ function createMockContext(init: {
     listener?.({ details: { type, ...properties } });
   };
 
-  return { ctx, dispatched, events, load, press, emit };
+  const setMode = (next: string) => {
+    mode = next;
+  };
+
+  const layerConfig = () => layer?.();
+
+  return { ctx, dispatched, toasts, events, load, press, emit, setMode, layerConfig };
 }
 
 // ── plugin init sanity check ──────────────────────────────
@@ -505,6 +522,69 @@ describe("arrow keys pass through the key layer", () => {
   it("a vim motion (j) is still consumed, proving the harness detects consumption", async () => {
     const { press } = await setup();
     expect(press("j")).toBe(true);
+  });
+});
+
+// ── modifier binds + reactive layer gating ────────────────
+
+describe("modifier combos and layer gating", () => {
+  it("ctrl+return in insert mode is consumed and dispatches input.submit", async () => {
+    const mock = createMockContext({ editor: undefined, options: { updateCheck: false } });
+    await mock.load();
+    // Still in insert mode (no escape first).
+    expect(mock.press("return", { ctrl: true })).toBe(true);
+    // cmd actions are dispatched deferred (setTimeout 0).
+    await new Promise((r) => setTimeout(r, 10));
+    expect(mock.dispatched).toContain("input.submit");
+  });
+
+  it("ctrl+o in insert mode enters one-shot normal mode", async () => {
+    const mock = createMockContext({ editor: undefined, options: { updateCheck: false } });
+    await mock.load();
+    expect(mock.press("o", { ctrl: true })).toBe(true);
+    expect(mock.toasts).toContain("(insert)");
+  });
+
+  it("normal-mode ctrl+letter passes through to the host", async () => {
+    const mock = createMockContext({ editor: undefined, options: { updateCheck: false } });
+    await mock.load();
+    mock.press("escape"); // enter normal mode
+    expect(mock.press("a", { ctrl: true })).toBe(false);
+  });
+
+  it("a pending permission on the session route makes keys pass through", async () => {
+    const mock = createMockContext({
+      editor: undefined,
+      options: { updateCheck: false },
+      route: { type: "session", sessionID: "root" },
+      permissions: [{ id: "p1" }],
+    });
+    await mock.load();
+    mock.press("escape");
+    expect(mock.press("h")).toBe(false);
+  });
+
+  it("a foreign input mode disables the layer; restoring the baseline re-enables it", async () => {
+    const mock = createMockContext({ editor: undefined, options: { updateCheck: false } });
+    await mock.load();
+    mock.press("escape"); // enter normal mode; baseline mode was "base"
+    expect(mock.press("j")).toBe(true);
+
+    mock.setMode("modal");
+    expect(mock.press("j")).toBe(false);
+
+    mock.setMode("base");
+    expect(mock.press("j")).toBe(true);
+  });
+
+  it("the /vim toggle disables the whole layer", async () => {
+    const mock = createMockContext({ editor: undefined, options: { updateCheck: false } });
+    await mock.load();
+    mock.press("escape");
+    const vimCmd = mock.layerConfig()?.commands?.find((c) => c.id === "vimcode.vim");
+    if (!vimCmd) throw new Error(":vim command not registered");
+    await vimCmd.run();
+    expect(mock.press("j")).toBe(false);
   });
 });
 
