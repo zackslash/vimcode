@@ -32,5 +32,8 @@
     "@types/node": "^26.6.2",
     "tsx": "^4.22.1",
     "typescript": "^5.9.3"
-  }
+  },
+  "oc-plugin": [
+    "tui"
+  ]
 }
