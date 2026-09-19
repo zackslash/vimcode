@@ -23,6 +23,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 - Permission/question prompts are navigable again: `handleKey` passes keys through whenever the active input mode differs from the baseline captured at layer registration (foreign input modes = an overlay owns the keyboard), and the router session check reads the V2 discriminated union (`route.type === "session"`, with `route.name` as a defensive fallback). Gating is dispatch-time only — v2.0.8 silently drops a command set in which any command carries function-valued `enabled`, and layer-level gating would hide `:q`/`:wq`/`:w`//vim` from the palette because the palette itself pushes a foreign input mode while open.
 
 ### Known gaps
+- Palette discovery: `:q`/`:wq`/`:w`/`:vim` do not appear in the ctrl+p command palette on OpenCode 2.0.8 (the palette's reachable-commands filter excludes them while its own input mode is pushed). Slash invocation in the prompt (`/q`, `/vim`, …) works fully.
 
 - Autocomplete disambiguation is best-effort: V2's `keymap.dispatch` returns `void` instead of `{ ok }`, so in insert mode Escape/Enter always dispatch `prompt.autocomplete.*` and then fall through; the autocomplete layer consumes the key when it is active.
 - Motion/delete commands (`input.move.*`, `input.delete.*`, `input.undo`, `app.exit`, `input.submit`) are still dispatched by command ID; if the host renames these they fail silently. The engine was not rewritten to direct editor-widget calls in this port.
