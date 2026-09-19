@@ -1,10 +1,9 @@
-// JSX's synthetic runtime import cannot resolve from cache-installed plugin
-// files (the runtime's module interception rewrites explicit source imports,
-// not transpiler-generated ones), so the blessed component mount is written
-// with an explicit createComponent call: jsx(<Commands/>) compiles to exactly
-// this. The component body runs once per mount with a persistent owner —
-// keymap layers created there live as long as the slot.
-import { createComponent } from "solid-js";
+// JSX and direct solid-js imports cannot resolve from cache-installed
+// plugin files on v2.0.8 (only host-injected specifiers work), so the slot
+// render stays plain TS. The render callback itself executes inside the
+// host slot tree where host APIs resolve; the layer is registered there.
+// TEMP-VERIFY toasts make each step of the chain observable.
+
 import type { V2Context } from "./seam";
 
 type RegisterInput = {
@@ -16,23 +15,6 @@ type RegisterInput = {
   toast: (message: string) => void;
 };
 
-// biome-ignore lint/suspicious/noExplicitAny: host-owned component props
-function VimLayer(props: any) {
-  props.toast("vimcode: layer");
-  props.onRegistered(props.safeModeCurrent());
-  props.context.keymap.layer(props.layerConfig);
-  try {
-    const reachable = props.context.keymap.commands();
-    const ours = reachable.filter((c: { id?: string; name?: string }) =>
-      String(c?.name ?? c?.id ?? "").startsWith("vimcode"),
-    ).length;
-    props.toast(`vimcode: ${ours}/${reachable.length} cmds`);
-  } catch (error) {
-    props.toast(`vimcode: cmds err ${String(error).slice(0, 40)}`);
-  }
-  return null;
-}
-
 export function registerCommandsSlot(input: RegisterInput) {
   const { context, layerConfig, safeModeCurrent, onRegistered, onUnregister, toast } = input;
   if (typeof context?.ui?.slot !== "function") {
@@ -42,16 +24,31 @@ export function registerCommandsSlot(input: RegisterInput) {
   }
   const unregister = context.ui.slot({
     append: "app",
-    // A component element, not a bare callback: the host mounts it, giving
-    // the keymap layer a persistent owner.
-    render: () =>
-      createComponent(VimLayer, {
-        context,
-        layerConfig,
-        safeModeCurrent,
-        onRegistered,
-        toast,
-      }),
+    render: () => {
+      toast("vimcode: layer");
+      if (typeof context?.keymap?.layer !== "function") {
+        // biome-ignore lint/suspicious/noConsole: TEMP-VERIFY loud guard
+        console.error("[vimcode] host API missing: keymap.layer");
+        return null;
+      }
+      const baseline = safeModeCurrent();
+      onRegistered(baseline);
+      context.keymap.layer(layerConfig as never);
+      try {
+        const reachable = context.keymap.commands();
+        const ours = reachable.filter((c: { id?: string; name?: string }) =>
+          String(c?.name ?? c?.id ?? "").startsWith("vimcode"),
+        ).length;
+        let active = "E";
+        try {
+          active = context.keymap.mode.current() === baseline ? "Y" : "N";
+        } catch {}
+        toast(`vimcode: ${ours}/${reachable.length} cmds base=${baseline} act=${active}`);
+      } catch (error) {
+        toast(`vimcode: cmds err ${String(error).slice(0, 40)}`);
+      }
+      return null;
+    },
   });
   if (typeof unregister === "function") onUnregister(unregister);
 }
