@@ -206,11 +206,11 @@ const plugin: V2Plugin = {
       }
     }
 
-    // Baseline input mode captured when the layer registers. Foreign input
-    // modes (dialogs, custom modes) then disable the whole layer reactively
-    // via `enabled`, so overlays whose key handling doesn't outrank ours
-    // still get their keys. Self-calibrating: if no baseline could be read,
-    // the layer stays always-enabled (the per-key checks remain the backstop).
+    // Baseline input mode captured when the layer registers. When the live
+    // mode differs (dialogs, custom modes pushed after registration),
+    // handleKey passes keys through so overlays whose key handling doesn't
+    // outrank ours still get them. Self-calibrating: if no baseline could be
+    // read, vim stays active (the per-key checks remain the backstop).
     let baselineMode: string | undefined;
     function vimLayerActive(): boolean {
       if (baselineMode === undefined) return true;
@@ -384,6 +384,12 @@ const plugin: V2Plugin = {
       // If vim mode is disabled, pass all keys through unmodified.
       if (state.disabled) return false;
 
+      // Pass through when a foreign input mode is active (dialogs, custom
+      // modes — anything that pushed a mode after our layer registered):
+      // the overlay's own layers receive the key. Reactive `enabled` is not
+      // an option — v2.0.8 drops commands with function-valued `enabled`.
+      if (!vimLayerActive()) return false;
+
       // Pass through when any overlay owns the keyboard: dialogs (command
       // palette, session list, etc.), question prompts, or permission prompts.
       if (overlayActive()) return false;
@@ -468,27 +474,24 @@ const plugin: V2Plugin = {
     // engine can ever handle gets its own command whose run delegates to
     // handleKey; returning false falls through to the host, so pass-through
     // semantics survive the intercept → layer migration.
-    // Gating is PER COMMAND, not layer-level: the palette lists only
-    // currently-reachable commands, and a foreign input mode (e.g. "modal")
-    // is pushed while the palette itself is open — layer-level `enabled`
-    // would therefore hide :q/:wq/:w//vim from the palette exactly when the
-    // palette is shown. Palette/slash commands have no bind and can't
-    // intercept keys, so they stay enabled in every mode.
-    const keyGate = () => !state.disabled && vimLayerActive();
-    const paletteGate = () => !state.disabled;
+    // Gating happens ONLY at dispatch time inside run(). v2.0.8 silently
+    // drops the entire command set when a command carries function-valued
+    // `enabled` (despite the type declaring boolean | (() => boolean)), and
+    // layer-level `enabled` hides commands from the palette because the
+    // palette pushes a foreign input mode while open.
     const layerConfig = () => ({
       mode: "global",
       priority: 10_000,
       commands: [
-        ...vimKeyCommands(handleKey).map((cmd) => ({ ...cmd, enabled: keyGate })),
+        ...vimKeyCommands(handleKey),
         {
           id: "vimcode.q",
           title: ":q",
           group: "Vim",
           palette: true,
-          enabled: paletteGate,
           slash: { name: "q", aliases: ["quit"] },
           run: () => {
+            if (state.disabled) return;
             setTimeout(() => dispatch("app.exit"), 0);
           },
         },
@@ -497,9 +500,9 @@ const plugin: V2Plugin = {
           title: ":wq",
           group: "Vim",
           palette: true,
-          enabled: paletteGate,
           slash: { name: "wq" },
           run: () => {
+            if (state.disabled) return;
             setTimeout(() => dispatch("app.exit"), 0);
           },
         },
@@ -508,9 +511,9 @@ const plugin: V2Plugin = {
           title: ":w",
           group: "Vim",
           palette: true,
-          enabled: paletteGate,
           slash: { name: "w", aliases: ["write"] },
           run: () => {
+            if (state.disabled) return;
             setTimeout(() => dispatch("input.submit"), 0);
           },
         },
@@ -519,7 +522,6 @@ const plugin: V2Plugin = {
           title: ":vim",
           group: "Vim",
           palette: true,
-          enabled: paletteGate,
           slash: { name: "vim" },
           run: () => {
             const result = toggleVimMode(state);
@@ -582,7 +584,6 @@ type KeyCommand = {
   bind: string;
   /* biome-ignore lint/suspicious/noExplicitAny: plugin-API seam, host-owned types */
   run: (input: unknown, event: any) => false | undefined;
-  enabled?: () => boolean;
 };
 
 function vimKeyCommands(handleKey: (event: V2Context) => false | undefined): KeyCommand[] {
