@@ -537,14 +537,6 @@ const plugin: V2Plugin = {
     // failure this port hit). The blessed pattern from the v2.0.8 feature
     // plugins (system/plugins.tsx) returns a component element from the
     // render callback, so the hook work happens inside the component body.
-    // TEMP-VERIFY: screen-capture signal that setup ran. Removed in a
-    // follow-up commit after runtime verification.
-    context?.ui?.toast?.show?.({ message: "vimcode: setup", variant: "info", duration: 1000 });
-    const debugToast = (message: string) => {
-      try {
-        context.ui?.toast?.show({ message, variant: "info", duration: 1500 });
-      } catch {}
-    };
     registerCommandsSlot({
       context,
       layerConfig,
@@ -555,7 +547,6 @@ const plugin: V2Plugin = {
       onUnregister: (off) => {
         disposers.push(off as () => void);
       },
-      toast: debugToast,
     });
 
     return () => {

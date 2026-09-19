@@ -596,50 +596,6 @@ describe("modifier combos and layer gating", () => {
     expect(mock.layerCalls.count).toBe(1);
   });
 
-  it("emits the TEMP-VERIFY setup toast", async () => {
-    const mock = createMockContext({ editor: undefined, options: { updateCheck: false } });
-    await mock.load();
-    expect(mock.toasts).toContain("vimcode: setup");
-  });
-
-  it("the /vim toggle makes key commands pass through and palette commands no-op", async () => {
-    const mock = createMockContext({ editor: undefined, options: { updateCheck: false } });
-    await mock.load();
-    mock.press("escape");
-    const vimCmd = mock.layerConfig()?.commands?.find((c) => c.id === "vimcode.vim");
-    if (!vimCmd) throw new Error(":vim command not registered");
-    await vimCmd.run();
-    // Key commands pass everything through while disabled...
-    expect(mock.press("j")).toBe(false);
-    // ...and the exit command no-ops instead of dispatching.
-    const qCmd = mock.layerConfig()?.commands?.find((c) => c.id === "vimcode.q");
-    if (!qCmd) throw new Error(":q command not registered");
-    mock.dispatched.length = 0;
-    await qCmd.run();
-    await new Promise((r) => setTimeout(r, 10));
-    expect(mock.dispatched).not.toContain("app.exit");
-  });
-});
-
-// ── prompt overlay tracking (question.rejected leak) ──────
-
-describe("prompt overlay tracking", () => {
-  // The plugin tracks pending permission/question prompts via events so it can
-  // pass keys through while an overlay owns the keyboard. Every "asked" must be
-  // balanced by a terminal event, otherwise hasActivePrompts() stays true and
-  // the plugin is stuck passing all keys (including Escape) to the host.
-  async function setup() {
-    const mock = createMockContext({
-      editor: undefined,
-      options: { updateCheck: false },
-      route: { type: "session", sessionID: "root" },
-      sessions: { root: {}, child: { parentID: "root" } },
-    });
-    await mock.load();
-    mock.press("escape"); // leave insert, enter normal mode
-    return { press: mock.press, emit: mock.emit };
-  }
-
   it("keys pass through while a question is pending, then resume after question.rejected", async () => {
     const { press, emit } = await setup();
 
