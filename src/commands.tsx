@@ -1,3 +1,4 @@
+/** @jsxImportSource @opentui/solid */
 // The v2.0.8 keymap bridge resolves Solid/OpenTUI hooks against the calling
 // component; calling keymap.layer() from a bare slot-render callback dies
 // silently (the hook lookup throws or no-ops and the slot pipeline swallows
