@@ -33,20 +33,27 @@ export function registerCommandsSlot(input: RegisterInput) {
       }
       const baseline = safeModeCurrent();
       onRegistered(baseline);
-      context.keymap.layer(layerConfig as never);
-      try {
-        const reachable = context.keymap.commands();
-        const ours = reachable.filter((c: { id?: string; name?: string }) =>
-          String(c?.name ?? c?.id ?? "").startsWith("vimcode"),
-        ).length;
-        let active = "E";
+      // useBindings registers the layer inside a deferred createEffect, so a
+      // synchronous commands() read observes the pre-registration snapshot.
+      // The layerConfig body is wrapped so errors thrown in that deferred
+      // effect — invisible to any try/catch around layer() itself — surface.
+      context.keymap.layer(() => {
         try {
-          active = context.keymap.mode.current() === baseline ? "Y" : "N";
-        } catch {}
-        toast(`vimcode: ${ours}/${reachable.length} cmds base=${baseline} act=${active}`);
-      } catch (error) {
-        toast(`vimcode: cmds err ${String(error).slice(0, 40)}`);
-      }
+          return (layerConfig as () => unknown)();
+        } catch (error) {
+          toast(`vimcode: layer err ${String(error).slice(0, 50)}`);
+          return { mode: "global", commands: [] };
+        }
+      });
+      setTimeout(() => {
+        try {
+          const reachable = context.keymap.commands();
+          const ours = reachable.filter((c: { id?: string }) => String(c?.id ?? "").startsWith("vimcode")).length;
+          toast(`vimcode: ${ours}/${reachable.length} cmds deferred`);
+        } catch (error) {
+          toast(`vimcode: cmds err ${String(error).slice(0, 40)}`);
+        }
+      }, 200);
       return null;
     },
   });
